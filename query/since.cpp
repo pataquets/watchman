@@ -3,155 +3,145 @@
 
 #include "watchman.h"
 
+#include <memory>
+
 enum since_what { SINCE_OCLOCK, SINCE_CCLOCK, SINCE_MTIME, SINCE_CTIME };
-
-struct since_term {
-  struct w_clockspec *spec;
-  enum since_what field;
-};
-
-
-static bool eval_since(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  auto term = (since_term*)data;
-  w_clock_t clock;
-  struct w_query_since since;
-  time_t tval = 0;
-
-  w_clockspec_eval_readonly(ctx->lock, term->spec, &since);
-
-  switch (term->field) {
-    case since_what::SINCE_OCLOCK:
-    case since_what::SINCE_CCLOCK:
-      clock = (term->field == since_what::SINCE_OCLOCK) ? file->otime : file->ctime;
-      if (since.is_timestamp) {
-        return since.timestamp > clock.timestamp;
-      }
-      if (since.clock.is_fresh_instance) {
-        return file->exists;
-      }
-      return clock.ticks > since.clock.ticks;
-    case since_what::SINCE_MTIME:
-      tval = file->stat.mtime.tv_sec;
-      break;
-    case since_what::SINCE_CTIME:
-      tval = file->stat.ctime.tv_sec;
-      break;
-  }
-
-  assert(since.is_timestamp);
-  return tval > since.timestamp;
-}
-
-static void dispose_since(void *data)
-{
-  auto term = (since_term*)data;
-  w_clockspec_free(term->spec);
-  free(data);
-}
 
 static struct {
   enum since_what value;
-  const char *label;
+  const char* label;
 } allowed_fields[] = {
-  { since_what::SINCE_OCLOCK, "oclock" },
-  { since_what::SINCE_CCLOCK, "cclock" },
-  { since_what::SINCE_MTIME,  "mtime" },
-  { since_what::SINCE_CTIME,  "ctime" },
+    {since_what::SINCE_OCLOCK, "oclock"},
+    {since_what::SINCE_CCLOCK, "cclock"},
+    {since_what::SINCE_MTIME, "mtime"},
+    {since_what::SINCE_CTIME, "ctime"},
 };
 
-static w_query_expr *since_parser(w_query *query, json_t *term)
-{
-  json_t *jval;
+class SinceExpr : public QueryExpr {
+  std::unique_ptr<ClockSpec> spec;
+  enum since_what field;
 
-  struct w_clockspec *spec;
-  struct since_term *sterm;
-  auto selected_field = since_what::SINCE_OCLOCK;
-  const char *fieldname = "oclock";
+ public:
+  explicit SinceExpr(std::unique_ptr<ClockSpec> spec, enum since_what field)
+      : spec(std::move(spec)), field(field) {}
 
-  if (!json_is_array(term)) {
-    query->errmsg = strdup("\"since\" term must be an array");
-    return NULL;
-  }
+  EvaluateResult evaluate(struct w_query_ctx* ctx, FileResult* file) override {
+    time_t tval = 0;
 
-  if (json_array_size(term) < 2 || json_array_size(term) > 3) {
-    query->errmsg = strdup("\"since\" term has invalid number of parameters");
-    return NULL;
-  }
+    auto since = spec->evaluate(
+        ctx->clockAtStartOfQuery.position(),
+        ctx->lastAgeOutTickValueAtStartOfQuery);
 
-  jval = json_array_get(term, 1);
-  spec = w_clockspec_parse(jval);
-  if (!spec) {
-    query->errmsg = strdup("invalid clockspec for \"since\" term");
-    return NULL;
-  }
-  if (spec->tag == w_cs_named_cursor) {
-    query->errmsg = strdup("named cursors are not allowed in \"since\" terms");
-    goto fail;
-  }
+    // Note that we use >= for the time comparisons in here so that we
+    // report the things that changed inclusive of the boundary presented.
+    // This is especially important for clients using the coarse unix
+    // timestamp as the since basis, as they would be much more
+    // likely to miss out on changes if we didn't.
 
-  jval = json_array_get(term, 2);
-  if (jval) {
-    size_t i;
-    bool valid = false;
+    switch (field) {
+      case since_what::SINCE_OCLOCK:
+      case since_what::SINCE_CCLOCK: {
+        const auto clock =
+            (field == since_what::SINCE_OCLOCK) ? file->otime() : file->ctime();
+        if (!clock.has_value()) {
+          return folly::none;
+        }
 
-    fieldname = json_string_value(jval);
-    if (!fieldname) {
-      query->errmsg = strdup("field name for \"since\" term must be a string");
-      goto fail;
-    }
-
-    for (i = 0; i < sizeof(allowed_fields) / sizeof(allowed_fields[0]); ++i) {
-      if (!strcmp(allowed_fields[i].label, fieldname)) {
-        selected_field = allowed_fields[i].value;
-        valid = true;
+        if (since.is_timestamp) {
+          return clock->timestamp >= since.timestamp;
+        }
+        if (since.clock.is_fresh_instance) {
+          return file->exists();
+        }
+        return clock->ticks > since.clock.ticks;
+      }
+      case since_what::SINCE_MTIME: {
+        auto stat = file->stat();
+        if (!stat.has_value()) {
+          return folly::none;
+        }
+        tval = stat->mtime.tv_sec;
+        break;
+      }
+      case since_what::SINCE_CTIME: {
+        auto stat = file->stat();
+        if (!stat.has_value()) {
+          return folly::none;
+        }
+        tval = stat->ctime.tv_sec;
         break;
       }
     }
 
-    if (!valid) {
-      ignore_result(asprintf(&query->errmsg,
-          "invalid field name \"%s\" for \"since\" term",
-          fieldname));
-      goto fail;
+    assert(since.is_timestamp);
+    return tval >= since.timestamp;
+  }
+
+  static std::unique_ptr<QueryExpr> parse(w_query*, const json_ref& term) {
+    auto selected_field = since_what::SINCE_OCLOCK;
+    const char* fieldname = "oclock";
+
+    if (!term.isArray()) {
+      throw QueryParseError("\"since\" term must be an array");
     }
-  }
 
-  switch (selected_field) {
-    case since_what::SINCE_CTIME:
-    case since_what::SINCE_MTIME:
-      if (spec->tag != w_cs_timestamp) {
-        ignore_result(asprintf(&query->errmsg,
-            "field \"%s\" requires a timestamp value "
-            "for comparison in \"since\" term",
-            fieldname));
-        goto fail;
+    if (json_array_size(term) < 2 || json_array_size(term) > 3) {
+      throw QueryParseError("\"since\" term has invalid number of parameters");
+    }
+
+    const auto& jval = term.at(1);
+    auto spec = ClockSpec::parseOptionalClockSpec(jval);
+    if (!spec) {
+      throw QueryParseError("invalid clockspec for \"since\" term");
+    }
+    if (spec->tag == w_cs_named_cursor) {
+      throw QueryParseError("named cursors are not allowed in \"since\" terms");
+    }
+
+    if (term.array().size() == 3) {
+      const auto& field = term.at(2);
+      size_t i;
+      bool valid = false;
+
+      fieldname = json_string_value(field);
+      if (!fieldname) {
+        throw QueryParseError("field name for \"since\" term must be a string");
       }
-      break;
-    case since_what::SINCE_OCLOCK:
-    case since_what::SINCE_CCLOCK:
-      /* we'll work with clocks or timestamps */
-      break;
+
+      for (i = 0; i < sizeof(allowed_fields) / sizeof(allowed_fields[0]); ++i) {
+        if (!strcmp(allowed_fields[i].label, fieldname)) {
+          selected_field = allowed_fields[i].value;
+          valid = true;
+          break;
+        }
+      }
+
+      if (!valid) {
+        throw QueryParseError(
+            "invalid field name \"", fieldname, "\" for \"since\" term");
+      }
+    }
+
+    switch (selected_field) {
+      case since_what::SINCE_CTIME:
+      case since_what::SINCE_MTIME:
+        if (spec->tag != w_cs_timestamp) {
+          throw QueryParseError(
+              "field \"",
+              fieldname,
+              "\" requires a timestamp value for comparison in \"since\" term");
+        }
+        break;
+      case since_what::SINCE_OCLOCK:
+      case since_what::SINCE_CCLOCK:
+        /* we'll work with clocks or timestamps */
+        break;
+    }
+
+    return std::make_unique<SinceExpr>(std::move(spec), selected_field);
   }
-
-  sterm = (since_term*)calloc(1, sizeof(*sterm));
-  if (!sterm) {
-    query->errmsg = strdup("out of memory");
-    goto fail;
-  }
-
-  sterm->spec = spec;
-  sterm->field = selected_field;
-
-  return w_query_expr_new(eval_since, dispose_since, sterm);
-
-fail:
-  w_clockspec_free(spec);
-  return NULL;
-}
-W_TERM_PARSER("since", since_parser)
+};
+W_TERM_PARSER("since", SinceExpr::parse)
 
 /* vim:ts=2:sw=2:et:
  */

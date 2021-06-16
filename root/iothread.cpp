@@ -2,21 +2,154 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include <chrono>
+#include "InMemoryView.h"
 
-static void io_thread(struct unlocked_watchman_root *unlocked)
-{
-  int timeoutms, biggest_timeout;
-  struct watchman_pending_collection pending;
-  struct write_locked_watchman_root lock;
+namespace watchman {
 
-  timeoutms = unlocked->root->trigger_settle;
+std::shared_future<void> InMemoryView::waitUntilReadyToQuery(
+    const std::shared_ptr<watchman_root>& root) {
+  auto lockPair = acquireLockedPair(root->recrawlInfo, crawlState_);
+
+  if (lockPair.second->promise && lockPair.second->future.valid()) {
+    return lockPair.second->future;
+  }
+
+  if (root->inner.done_initial.load(std::memory_order_acquire) &&
+      !lockPair.first->shouldRecrawl) {
+    // Return an already satisfied future
+    std::promise<void> p;
+    p.set_value();
+    return p.get_future();
+  }
+
+  // Not yet done, so queue up the promise
+  lockPair.second->promise = std::make_unique<std::promise<void>>();
+  lockPair.second->future =
+      std::shared_future<void>(lockPair.second->promise->get_future());
+  return lockPair.second->future;
+}
+
+void InMemoryView::fullCrawl(
+    const std::shared_ptr<watchman_root>& root,
+    PendingChanges& pending) {
+  root->recrawlInfo.wlock()->crawlStart = std::chrono::steady_clock::now();
+
+  w_perf_t sample("full-crawl");
+
+  auto view = view_.wlock();
+  // Ensure that we observe these files with a new, distinct clock,
+  // otherwise a fresh subscription established immediately after a watch
+  // can get stuck with an empty view until another change is observed
+  mostRecentTick_.fetch_add(1, std::memory_order_acq_rel);
+
+  auto start = std::chrono::system_clock::now();
+  pending_.lock()->add(root->root_path, start, W_PENDING_RECURSIVE);
+  while (true) {
+    // There is the potential for a subtle race condition here.  Since we now
+    // coalesce overlaps we must consume our outstanding set before we merge
+    // in any new kernel notification information or we risk missing out on
+    // observing changes that happen during the initial crawl.  This
+    // translates to a two level loop; the outer loop sweeps in data from
+    // inotify, then the inner loop processes it and any dirs that we pick up
+    // from recursive processing.
+    {
+      auto lock = pending_.lock();
+      pending.append(lock->stealItems(), lock->stealSyncs());
+    }
+    if (pending.empty()) {
+      break;
+    }
+
+    (void)processAllPending(root, *view, pending);
+  }
+
+  auto [recrawlInfo, crawlState] =
+      acquireLockedPair(root->recrawlInfo, crawlState_);
+  recrawlInfo->shouldRecrawl = false;
+  recrawlInfo->crawlFinish = std::chrono::steady_clock::now();
+  if (crawlState->promise) {
+    crawlState->promise->set_value();
+    crawlState->promise.reset();
+  }
+  root->inner.done_initial.store(true, std::memory_order_release);
+
+  // There is no need to hold locks while logging, and abortAllCookies resolves
+  // a Promise which can run arbitrary code, so locks must be released here.
+  auto recrawlCount = recrawlInfo->recrawlCount;
+  recrawlInfo.unlock();
+  crawlState.unlock();
+  view.unlock();
+
+  root->cookies.abortAllCookies();
+
+  sample.add_root_meta(root);
+
+  sample.finish();
+  sample.force_log();
+  sample.log();
+
+  logf(ERR, "{}crawl complete\n", recrawlCount ? "re" : "");
+}
+
+// Performs settle-time actions.
+// Returns true if the root was reaped and the io thread should terminate.
+static bool do_settle_things(InMemoryView& view, watchman_root& root) {
+  // No new pending items were given to us, so consider that
+  // we may now be settled.
+
+  root.processPendingSymlinkTargets();
+
+  if (!root.inner.done_initial.load(std::memory_order_acquire)) {
+    // we need to recrawl, stop what we're doing here
+    return false;
+  }
+
+  view.warmContentCache();
+
+  root.unilateralResponses->enqueue(json_object({{"settled", json_true()}}));
+
+  if (root.considerReap()) {
+    root.stopWatch();
+    return true;
+  }
+
+  root.considerAgeOut();
+  return false;
+}
+
+void InMemoryView::clientModeCrawl(const std::shared_ptr<watchman_root>& root) {
+  PendingChanges pending;
+  fullCrawl(root, pending);
+}
+
+bool InMemoryView::handleShouldRecrawl(watchman_root& root) {
+  {
+    auto info = root.recrawlInfo.rlock();
+    if (!info->shouldRecrawl) {
+      return false;
+    }
+  }
+
+  if (!root.inner.cancelled) {
+    auto info = root.recrawlInfo.wlock();
+    info->recrawlCount++;
+    root.inner.done_initial.store(false, std::memory_order_release);
+  }
+
+  return true;
+}
+
+void InMemoryView::ioThread(const std::shared_ptr<watchman_root>& root) {
+  PendingChanges localPending;
+
+  int timeoutms = root->trigger_settle;
 
   // Upper bound on sleep delay.  These options are measured in seconds.
-  biggest_timeout = unlocked->root->gc_interval;
+  int biggest_timeout = root->gc_interval.count();
   if (biggest_timeout == 0 ||
-      (unlocked->root->idle_reap_age != 0 &&
-       unlocked->root->idle_reap_age < biggest_timeout)) {
-    biggest_timeout = unlocked->root->idle_reap_age;
+      (root->idle_reap_age != 0 && root->idle_reap_age < biggest_timeout)) {
+    biggest_timeout = root->idle_reap_age;
   }
   if (biggest_timeout == 0) {
     biggest_timeout = 86400;
@@ -24,89 +157,41 @@ static void io_thread(struct unlocked_watchman_root *unlocked)
   // And convert to milliseconds
   biggest_timeout *= 1000;
 
-  w_pending_coll_init(&pending);
-
-  while (!unlocked->root->inner.cancelled) {
-    bool pinged;
-
-    if (!unlocked->root->inner.done_initial) {
-      struct timeval start;
-      w_perf_t sample("full-crawl");
-
+  while (!stopThreads_) {
+    if (!root->inner.done_initial.load(std::memory_order_acquire)) {
       /* first order of business is to find all the files under our root */
-      if (cfg_get_bool(unlocked->root, "iothrottle", false)) {
-        w_ioprio_set_low();
-      }
-      w_root_lock(unlocked, "io_thread: bump ticks", &lock);
-      // Ensure that we observe these files with a new, distinct clock,
-      // otherwise a fresh subscription established immediately after a watch
-      // can get stuck with an empty view until another change is observed
-      lock.root->inner.ticks++;
-      gettimeofday(&start, NULL);
-      w_pending_coll_add(&lock.root->pending, lock.root->root_path, start, 0);
-      // There is the potential for a subtle race condition here.  The boolean
-      // parameter indicates whether we want to merge in the set of
-      // notifications pending from the watcher or not.  Since we now coalesce
-      // overlaps we must consume our outstanding set before we merge in any
-      // new kernel notification information or we risk missing out on
-      // observing changes that happen during the initial crawl.  This
-      // translates to a two level loop; the outer loop sweeps in data from
-      // inotify, then the inner loop processes it and any dirs that we pick up
-      // from recursive processing.
-      while (w_root_process_pending(&lock, &pending, true)) {
-        while (w_root_process_pending(&lock, &pending, false)) {
-          ;
-        }
-      }
-      lock.root->inner.done_initial = true;
-      sample.add_root_meta(lock.root);
-      w_root_unlock(&lock, unlocked);
+      fullCrawl(root, localPending);
 
-      if (cfg_get_bool(unlocked->root, "iothrottle", false)) {
-        w_ioprio_set_normal();
-      }
-
-      sample.finish();
-      sample.force_log();
-      sample.log();
-
-      w_log(W_LOG_ERR, "%scrawl complete\n",
-            unlocked->root->recrawl_count ? "re" : "");
-      timeoutms = unlocked->root->trigger_settle;
+      timeoutms = root->trigger_settle;
     }
 
     // Wait for the notify thread to give us pending items, or for
     // the settle period to expire
-    w_log(W_LOG_DBG, "poll_events timeout=%dms\n", timeoutms);
-    pinged = w_pending_coll_lock_and_wait(&unlocked->root->pending, timeoutms);
-    w_log(W_LOG_DBG, " ... wake up (pinged=%s)\n", pinged ? "true" : "false");
-    w_pending_coll_append(&pending, &unlocked->root->pending);
-    w_pending_coll_unlock(&unlocked->root->pending);
+    bool pinged;
+    {
+      logf(DBG, "poll_events timeout={}ms\n", timeoutms);
+      auto targetPendingLock =
+          pending_.lockAndWait(std::chrono::milliseconds(timeoutms), pinged);
+      logf(DBG, " ... wake up (pinged={})\n", pinged);
+      localPending.append(
+          targetPendingLock->stealItems(), targetPendingLock->stealSyncs());
+    }
 
-    if (!pinged && w_pending_coll_size(&pending) == 0) {
-      process_pending_symlink_targets(unlocked);
+    // Do we need to recrawl?
+    if (handleShouldRecrawl(*root)) {
+      // TODO: can this just continue? handleShouldRecrawl sets done_initial to
+      // false.
+      fullCrawl(root, localPending);
+      timeoutms = root->trigger_settle;
+      continue;
+    }
 
-      // No new pending items were given to us, so consider that
-      // we may now be settled.
-
-      w_root_lock(unlocked, "io_thread: settle out", &lock);
-      if (!lock.root->inner.done_initial) {
-        // we need to recrawl, stop what we're doing here
-        w_root_unlock(&lock, unlocked);
-        continue;
-      }
-
-      process_subscriptions(&lock);
-      process_triggers(&lock);
-      if (consider_reap(&lock)) {
-        w_root_unlock(&lock, unlocked);
-        w_root_stop_watch(unlocked);
+    // Waiting for an event timed out, so consider the root settled.
+    if (!pinged && localPending.empty()) {
+      if (do_settle_things(*this, *root)) {
         break;
       }
-      consider_age_out(&lock);
-      w_root_unlock(&lock, unlocked);
-
-      timeoutms = MIN(biggest_timeout, timeoutms * 2);
+      timeoutms = std::min(biggest_timeout, timeoutms * 2);
       continue;
     }
 
@@ -114,38 +199,106 @@ static void io_thread(struct unlocked_watchman_root *unlocked)
 
     // We are now, by definition, unsettled, so reduce sleep timeout
     // to the settle duration ready for the next loop through
-    timeoutms = unlocked->root->trigger_settle;
+    timeoutms = root->trigger_settle;
 
-    w_root_lock(unlocked, "io_thread: process notifications", &lock);
-    if (!lock.root->inner.done_initial) {
-      // we need to recrawl.  Discard these notifications
-      w_pending_coll_drain(&pending);
-      w_root_unlock(&lock, unlocked);
-      continue;
+    // Some Linux 5.6 kernels will report inotify events before the file has
+    // been evicted from the cache, causing Watchman to incorrectly think the
+    // file is still on disk after it's unlinked. If configured, allow a brief
+    // sleep to mitigate.
+    //
+    // Careful with this knob: it adds latency to every query by delaying cookie
+    // processing.
+    auto notify_sleep_ms = config_.getInt("notify_sleep_ms", 0);
+    if (notify_sleep_ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(notify_sleep_ms));
     }
 
-    lock.root->inner.ticks++;
-    // If we're not settled, we need an opportunity to age out
-    // dead file nodes.  This happens in the test harness.
-    consider_age_out(&lock);
+    auto view = view_.wlock();
 
-    while (w_root_process_pending(&lock, &pending, false)) {
-      ;
+    // fullCrawl unconditionally sets done_initial to true and if
+    // handleShouldRecrawl set it false, execution wouldn't reach this part of
+    // the loop.
+    w_check(
+        root->inner.done_initial.load(std::memory_order_acquire),
+        "A full crawl should not be pending at this point in the loop.");
+
+    mostRecentTick_.fetch_add(1, std::memory_order_acq_rel);
+
+    auto isDesynced = processAllPending(root, *view, localPending);
+    if (isDesynced == IsDesynced::Yes) {
+      logf(ERR, "recrawl complete, aborting all pending cookies\n");
+      root->cookies.abortAllCookies();
     }
-
-    w_root_unlock(&lock, unlocked);
   }
-
-  w_pending_coll_destroy(&pending);
 }
 
-void w_root_process_path(
-    struct write_locked_watchman_root* lock,
-    struct watchman_pending_collection* coll,
-    const w_string& full_path,
-    struct timeval now,
-    int flags,
-    struct watchman_dir_ent* pre_stat) {
+InMemoryView::IsDesynced InMemoryView::processAllPending(
+    const std::shared_ptr<watchman_root>& root,
+    ViewDatabase& view,
+    PendingChanges& coll) {
+  auto desyncState = IsDesynced::No;
+
+  // Don't resolve any of these until any recursive crawls are done.
+  std::vector<std::vector<folly::Promise<folly::Unit>>> allSyncs;
+
+  while (!coll.empty()) {
+    logf(DBG, "processing {} events in {}\n", coll.size(), rootPath_);
+
+    auto pending = coll.stealItems();
+    auto syncs = coll.stealSyncs();
+    if (syncs.empty()) {
+      w_check(
+          pending != nullptr,
+          "coll.stealItems() and coll.size() did not agree about its size");
+    } else {
+      allSyncs.push_back(std::move(syncs));
+    }
+
+    while (pending) {
+      if (!stopThreads_) {
+        if (pending->flags & W_PENDING_IS_DESYNCED) {
+          // The watcher is desynced but some cookies might be written to disk
+          // while the recursive crawl is ongoing. We are going to specifically
+          // ignore these cookies during that recursive crawl to avoid a race
+          // condition where cookies might be seen before some files have been
+          // observed as changed on disk. Due to this, and the fact that cookies
+          // notifications might simply have been dropped by the watcher, we
+          // need to abort the pending cookies to force them to be recreated on
+          // disk, and thus re-seen.
+          if (pending->flags & W_PENDING_CRAWL_ONLY) {
+            desyncState = IsDesynced::Yes;
+          }
+        }
+
+        // processPath may insert new pending items into `coll`,
+        processPath(root, view, coll, *pending, nullptr);
+      }
+
+      // TODO: Document that continuing to run this loop when stopThreads_ is
+      // true fixes a stack overflow when pending is long.
+      pending = std::move(pending->next);
+    }
+  }
+
+  for (auto& outer : allSyncs) {
+    for (auto& sync : outer) {
+      sync.setValue();
+    }
+  }
+
+  return desyncState;
+}
+
+void InMemoryView::processPath(
+    const std::shared_ptr<watchman_root>& root,
+    ViewDatabase& view,
+    PendingChanges& coll,
+    const PendingChange& pending,
+    const watchman_dir_ent* pre_stat) {
+  w_assert(
+      pending.path.size() >= rootPath_.size(),
+      "full_path must be a descendant of the root directory\n");
+
   /* From a particular query's point of view, there are four sorts of cookies we
    * can observe:
    * 1. Cookies that this query has created. This marks the end of this query's
@@ -160,94 +313,40 @@ void w_root_process_path(
    *
    * The below condition is true for cases 1 and 2 and false for 3 and 4.
    */
-  if (w_string_startswith(full_path, lock->root->query_cookie_prefix)) {
-    bool consider_cookie =
-        (lock->root->watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS)
-        ? ((flags & W_PENDING_VIA_NOTIFY) || !lock->root->inner.done_initial)
-        : true;
-
-    if (!consider_cookie) {
-      // Never allow cookie files to show up in the tree
-      return;
+  if (cookies_.isCookiePrefix(pending.path)) {
+    bool consider_cookie;
+    if (watcher_->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
+      // The watcher gives us file level notification, thus only consider
+      // cookies if this path is coming directly from the watcher, not from a
+      // recursive crawl.
+      consider_cookie = (pending.flags & W_PENDING_VIA_NOTIFY) ||
+          !root->inner.done_initial.load(std::memory_order_acquire);
+    } else {
+      // If we are de-synced, we shouldn't consider cookies as we are currently
+      // walking directories recursively and we need to wait for after the
+      // directory is fully re-crawled before notifying the cookie. At the end
+      // of the crawl, cookies will be cancelled and re-created.
+      consider_cookie =
+          (pending.flags & W_PENDING_IS_DESYNCED) != W_PENDING_IS_DESYNCED;
     }
 
-    auto cookie_iter = lock->root->query_cookies.find(full_path);
-    w_log(
-        W_LOG_DBG,
-        "cookie for %s? %s\n",
-        full_path.c_str(),
-        cookie_iter != lock->root->query_cookies.end() ? "yes" : "no");
-
-    if (cookie_iter != lock->root->query_cookies.end()) {
-      auto cookie = cookie_iter->second;
-      cookie->seen = true;
-      pthread_cond_signal(&cookie->cond);
+    if (consider_cookie) {
+      cookies_.notifyCookie(pending.path);
     }
 
     // Never allow cookie files to show up in the tree
     return;
   }
 
-  if (w_string_equal(full_path, lock->root->root_path)
-      || (flags & W_PENDING_CRAWL_ONLY) == W_PENDING_CRAWL_ONLY) {
-    crawler(lock, coll, full_path, now,
-        (flags & W_PENDING_RECURSIVE) == W_PENDING_RECURSIVE);
+  if (w_string_equal(pending.path, rootPath_) ||
+      (pending.flags & W_PENDING_CRAWL_ONLY)) {
+    crawler(root, view, coll, pending);
   } else {
-    stat_path(lock, coll, full_path, now, flags, pre_stat);
+    statPath(*root, view, coll, pending, pre_stat);
   }
 }
 
-bool w_root_process_pending(struct write_locked_watchman_root *lock,
-    struct watchman_pending_collection *coll,
-    bool pull_from_root)
-{
-  struct watchman_pending_fs *p, *pending;
-
-  if (pull_from_root) {
-    // You MUST own root->pending lock for this
-    w_pending_coll_append(coll, &lock->root->pending);
-  }
-
-  if (!coll->pending) {
-    return false;
-  }
-
-  w_log(
-      W_LOG_DBG,
-      "processing %d events in %s\n",
-      w_pending_coll_size(coll),
-      lock->root->root_path.c_str());
-
-  // Steal the contents
-  pending = coll->pending;
-  coll->pending = NULL;
-  w_pending_coll_drain(coll);
-
-  while (pending) {
-    p = pending;
-    pending = p->next;
-
-    if (!lock->root->inner.cancelled) {
-      w_root_process_path(lock, coll, p->path, p->now, p->flags, NULL);
-    }
-
-    w_pending_fs_free(p);
-  }
-
-  return true;
-}
-
-void *run_io_thread(void *arg)
-{
-  struct unlocked_watchman_root unlocked = {(w_root_t*)arg};
-
-  w_set_thread_name("io %s", unlocked.root->root_path.c_str());
-  io_thread(&unlocked);
-  w_log(W_LOG_DBG, "out of loop\n");
-
-  w_root_delref(&unlocked);
-  return 0;
-}
+} // namespace watchman
 
 /* vim:ts=2:sw=2:et:
  */

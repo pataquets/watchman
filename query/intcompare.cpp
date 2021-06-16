@@ -3,44 +3,41 @@
 
 #include "watchman.h"
 
+#include <memory>
+
 // Helper functions for integer comparisons in query expressions
 
 static const struct {
-  const char *opname;
+  const char* opname;
   enum w_query_icmp_op op;
 } opname_to_op[] = {
-  {"eq", W_QUERY_ICMP_EQ},
-  {"ne", W_QUERY_ICMP_NE},
-  {"gt", W_QUERY_ICMP_GT},
-  {"ge", W_QUERY_ICMP_GE},
-  {"lt", W_QUERY_ICMP_LT},
-  {"le", W_QUERY_ICMP_LE},
+    {"eq", W_QUERY_ICMP_EQ},
+    {"ne", W_QUERY_ICMP_NE},
+    {"gt", W_QUERY_ICMP_GT},
+    {"ge", W_QUERY_ICMP_GE},
+    {"lt", W_QUERY_ICMP_LT},
+    {"le", W_QUERY_ICMP_LE},
 };
 
 // term is a json array that looks like:
 // ["size", "eq", 1024]
-bool parse_int_compare(json_t *term, struct w_query_int_compare *comp,
-    char **errmsg) {
-  const char *opname;
+void parse_int_compare(const json_ref& term, struct w_query_int_compare* comp) {
+  const char* opname;
   size_t i;
   bool found = false;
 
   if (json_array_size(term) != 3) {
-    ignore_result(asprintf(errmsg, "integer comparator must have 3 elements"));
-    return false;
+    throw QueryParseError("integer comparator must have 3 elements");
   }
-  if (!json_is_string(json_array_get(term, 1))) {
-    ignore_result(asprintf(errmsg, "integer comparator op must be a string"));
-    return false;
+  if (!json_array_get(term, 1).isString()) {
+    throw QueryParseError("integer comparator op must be a string");
   }
-  if (!json_is_integer(json_array_get(term, 2))) {
-    ignore_result(asprintf(errmsg,
-          "integer comparator operand must be an integer"));
-    return false;
+  if (!json_array_get(term, 2).isInt()) {
+    throw QueryParseError("integer comparator operand must be an integer");
   }
 
   opname = json_string_value(json_array_get(term, 1));
-  for (i = 0; i < sizeof(opname_to_op)/sizeof(opname_to_op[0]); i++) {
+  for (i = 0; i < sizeof(opname_to_op) / sizeof(opname_to_op[0]); i++) {
     if (!strcmp(opname_to_op[i].opname, opname)) {
       comp->op = opname_to_op[i].op;
       found = true;
@@ -49,18 +46,14 @@ bool parse_int_compare(json_t *term, struct w_query_int_compare *comp,
   }
 
   if (!found) {
-    ignore_result(asprintf(errmsg,
-          "integer comparator opname `%s' is invalid",
-          opname));
-    return false;
+    throw QueryParseError(folly::to<std::string>(
+        "integer comparator opname `", opname, "' is invalid"));
   }
 
-
-  comp->operand = json_integer_value(json_array_get(term, 2));
-  return true;
+  comp->operand = json_array_get(term, 2).asInt();
 }
 
-bool eval_int_compare(json_int_t ival, struct w_query_int_compare *comp) {
+bool eval_int_compare(json_int_t ival, struct w_query_int_compare* comp) {
   switch (comp->op) {
     case W_QUERY_ICMP_EQ:
       return ival == comp->operand;
@@ -80,42 +73,44 @@ bool eval_int_compare(json_int_t ival, struct w_query_int_compare *comp) {
   }
 }
 
-static bool eval_size(struct w_query_ctx *ctx, struct watchman_file *file,
-    void *data)
-{
-  auto comp = (w_query_int_compare*)data;
-  unused_parameter(ctx);
+class SizeExpr : public QueryExpr {
+  w_query_int_compare comp;
 
-  // Removed files never evaluate true
-  if (!file->exists) {
-    return false;
+ public:
+  explicit SizeExpr(w_query_int_compare comp) : comp(comp) {}
+
+  EvaluateResult evaluate(struct w_query_ctx*, FileResult* file) override {
+    auto exists = file->exists();
+    auto size = file->size();
+
+    if (!exists.has_value()) {
+      return folly::none;
+    }
+
+    // Removed files never match
+    if (!exists.value()) {
+      return false;
+    }
+
+    if (!size.has_value()) {
+      return folly::none;
+    }
+
+    return eval_int_compare(size.value(), &comp);
   }
 
-  return eval_int_compare(file->stat.size, comp);
-}
+  static std::unique_ptr<QueryExpr> parse(w_query*, const json_ref& term) {
+    if (!term.isArray()) {
+      throw QueryParseError("Expected array for 'size' term");
+    }
 
-static w_query_expr *size_parser(w_query *query, json_t *term) {
-  struct w_query_int_compare *comp;
+    w_query_int_compare comp;
+    parse_int_compare(term, &comp);
 
-  if (!json_is_array(term)) {
-    ignore_result(asprintf(&query->errmsg, "Expected array for 'size' term"));
-    return NULL;
+    return std::make_unique<SizeExpr>(comp);
   }
-
-  comp = (w_query_int_compare*)calloc(1, sizeof(*comp));
-  if (!comp) {
-    ignore_result(asprintf(&query->errmsg, "out of memory"));
-    return NULL;
-  }
-
-  if (!parse_int_compare(term, comp, &query->errmsg)) {
-    free(comp);
-    return NULL;
-  }
-
-  return w_query_expr_new(eval_size, free, comp);
-}
-W_TERM_PARSER("size", size_parser)
+};
+W_TERM_PARSER("size", SizeExpr::parse)
 
 /* vim:ts=2:sw=2:et:
  */

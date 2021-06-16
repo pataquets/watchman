@@ -1,9 +1,10 @@
 ---
-id: cmd.since
+pageid: cmd.since
 title: since
 layout: docs
 section: Commands
 permalink: docs/cmd/since.html
+redirect_from: docs/cmd/since/
 ---
 
 ```bash

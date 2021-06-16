@@ -5,39 +5,34 @@
 
 void set_poison_state(
     const w_string& dir,
-    struct timeval now,
+    std::chrono::system_clock::time_point now,
     const char* syscall,
-    int err,
-    const char* reason) {
-  char *why = NULL;
-
-  if (poisoned_reason) {
+    const std::error_code& err) {
+  if (!poisoned_reason.rlock()->empty()) {
     return;
   }
 
-  ignore_result(asprintf(&why,
-"A non-recoverable condition has triggered.  Watchman needs your help!\n"
-"The triggering condition was at timestamp=%ld: %s(%.*s) -> %s\n"
-"All requests will continue to fail with this message until you resolve\n"
-"the underlying problem.  You will find more information on fixing this at\n"
-"%s#poison-%s\n",
-    (long)now.tv_sec,
-    syscall,
-    int(dir.size()),
-    dir.data(),
-    reason ? reason : strerror(err),
-    cfg_get_trouble_url(),
-    syscall
-  ));
+  auto why = folly::to<std::string>(
+      "A non-recoverable condition has triggered.  Watchman needs your help!\n"
+      "The triggering condition was at timestamp=",
+      std::chrono::system_clock::to_time_t(now),
+      ": ",
+      syscall,
+      "(",
+      dir,
+      ") -> ",
+      err.message(),
+      "\n"
+      "All requests will continue to fail with this message until you resolve\n"
+      "the underlying problem.  You will find more information on fixing this at\n",
+      cfg_get_trouble_url(),
+      "#poison-",
+      syscall,
+      "\n");
 
-  w_log(W_LOG_ERR, "%s", why);
-
-  // This assignment can race for store with other threads.  We don't
-  // care about that; we consider ourselves broken and the worst case
-  // is that we leak a handful of strings around the race
-  poisoned_reason = why;
+  watchman::log(watchman::ERR, why);
+  *poisoned_reason.wlock() = why;
 }
-
 
 /* vim:ts=2:sw=2:et:
  */

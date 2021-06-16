@@ -1,9 +1,10 @@
 ---
-id: expr.name
+pageid: expr.name
 title: name & iname
 layout: docs
 section: Expression Terms
 permalink: docs/expr/name.html
+redirect_from: docs/expr/name/
 ---
 
 The `name` expression performs exact matches against file names.  By default it
@@ -29,8 +30,8 @@ of `name`.
 
 *Since 2.9.9.*
 
-Starting in version 2.9.9, on OS X systems where the watched root is a case
-insensitive filesystem (this is the common case for OS X), `name` is equivalent
+Starting in version 2.9.9, on macOS systems where the watched root is a case
+insensitive filesystem (this is the common case for macOS), `name` is equivalent
 to `iname`.
 
 *Since 4.7.*

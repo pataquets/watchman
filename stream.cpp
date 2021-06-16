@@ -3,84 +3,32 @@
 
 #include "watchman.h"
 
-w_stm_t w_stm_connect(const char *path, int timeoutms) {
+std::unique_ptr<watchman_stream> w_stm_connect(int timeoutms) {
+  // Default to using unix domain sockets unless disabled by config
+  auto use_unix_domain = Configuration().getBool("use-unix-domain", true);
+
+  if (use_unix_domain && !disable_unix_socket) {
+    auto stm = w_stm_connect_unix(get_unix_sock_name().c_str(), timeoutms);
+    if (stm) {
+      return stm;
+    }
+  }
+
 #ifdef _WIN32
-  return w_stm_connect_named_pipe(path, timeoutms);
-#else
-  return w_stm_connect_unix(path, timeoutms);
+  if (!disable_named_pipe) {
+    return w_stm_connect_named_pipe(
+        get_named_pipe_sock_path().c_str(), timeoutms);
+  }
 #endif
+
+  return nullptr;
 }
 
-int w_stm_close(w_stm_t stm) {
-  int res;
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return -1;
+int w_poll_events(struct watchman_event_poll* p, int n, int timeoutms) {
+#ifdef _WIN32
+  if (!p->evt->isSocket()) {
+    return w_poll_events_named_pipe(p, n, timeoutms);
   }
-  res = stm->ops->op_close(stm);
-  if (res == 0) {
-    stm->ops = NULL;
-    stm->handle = NULL;
-    free(stm);
-  }
-  return res;
-}
-
-int w_stm_read(w_stm_t stm, void *buf, int size) {
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return -1;
-  }
-  return stm->ops->op_read(stm, buf, size);
-}
-
-int w_stm_write(w_stm_t stm, const void *buf, int size) {
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return -1;
-  }
-  return stm->ops->op_write(stm, buf, size);
-}
-
-void w_stm_get_events(w_stm_t stm, w_evt_t *readable) {
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return;
-  }
-  stm->ops->op_get_events(stm, readable);
-}
-
-void w_stm_set_nonblock(w_stm_t stm, bool nonb) {
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return;
-  }
-  stm->ops->op_set_nonblock(stm, nonb);
-}
-
-bool w_stm_rewind(w_stm_t stm) {
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return false;
-  }
-  return stm->ops->op_rewind(stm);
-}
-
-bool w_stm_shutdown(w_stm_t stm) {
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return false;
-  }
-  return stm->ops->op_shutdown(stm);
-}
-
-bool w_stm_peer_is_owner(w_stm_t stm) {
-  if (!stm || stm->handle == NULL || stm->ops == NULL) {
-    errno = EBADF;
-    return false;
-  }
-  if (!stm->ops->op_peer_is_owner) {
-    return false;
-  }
-  return stm->ops->op_peer_is_owner(stm);
+#endif
+  return w_poll_events_sockets(p, n, timeoutms);
 }

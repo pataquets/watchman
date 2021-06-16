@@ -1,14 +1,122 @@
 ---
-id: release-notes
+pageid: release-notes
 title: Release Notes
 layout: docs
 section: Installation
 permalink: docs/release-notes.html
+redirect_from: docs/release-notes/
 ---
+
+Watchman is continuously deployed inside Facebook, which means that we don't
+explicitly maintain version numbers.  We have automation that cuts a weekly
+tag with a named derived from the date.  You can learn more about how to reason
+about supported *capabilities* and our backwards compatibility guidelines
+in the [Compatibility Rules](compatibility.html) docs.
 
 We focus on the highlights only in these release notes.  For a full history
 that includes all of the gory details, please see [the commit history on
 GitHub](https://github.com/facebook/watchman/commits/master).
+
+### Watchman v2020.07.13.00
+
+* Added script `watchman-replicate-subscription`. It can replicate an 
+  existing watchman subscription. Integrators can use this script to validate
+  watchman notifications their client is receiving.
+* Added support for suffix sets in suffix expressions.  You now can specify
+  multiple suffixes to match against by setting the second argument to a list
+  of suffixes. See `suffix-set` documentation for
+  [more details](/watchman/docs/expr/suffix.html#suffix-set)
+* pywatchman: introduced new pywatchman_aio client for python
+* Windows: we no longer trust environment variables to locate the state directory
+  which should result in a better experience for users that mix cygwin, mingw,
+  native windows and/or WSL or other environments
+* Windows: we now support unix domain sockets on Windows 10.  The CLI will prefer
+  to use unix domain sockets when available.
+
+We weren't great at updating the release notes since the prior release;
+there was a lot of work to support our sister project EdenFS that isn't
+broadly relevant to those outside FB at the time of writing.
+
+### Watchman 4.9.0 (2017-08-24)
+
+* New field: `content.sha1hex`.  This field expands to the SHA1 hash of
+  the file contents, expressed in hex digits (40 character hex string).
+  Watchman maintains a cache of the content hashes and can compute the
+  hash on demand and also heuristically as files are changed.  This is
+  useful for tooling that wants to perform more intelligent cache invalidation
+  or build artifact fetching from content addressed storage.
+* Experimental feature: Source Control Aware query mode.  Currently supports
+  only Mercurial (patches to add Git support are welcomed!).  SCM aware query
+  mode helps to keep response sizes closer to `O(what-you-changed)` than
+  to `O(all-repo-changes)` when rebasing your code.  Using this feature
+  effectively may require some additional infrastructure to compute and
+  associate data with revisions from your repo.
+* Fixed an issue that resulted in the perf logging thread deadlocking when
+  `perf_logger_command` is enabled in the global configuration
+* Fixed an issue where queries larger than 1MB would likely result in
+  a PDU error response.
+* Reduced lock contention for subscriptions that do no use the advanced
+  settling (`drop`, `defer`) options.
+* Fixed `since` generator behavior when using unix timestamps rather than
+  the preferred clock string syntax
+* Improved the reporting of "new" files in watchman results
+* Improved performance of handling changes on case insensitive filesystems
+* Windows: promoted from alpha to beta status!
+* Windows: fixed some performance and reliability issues
+* Windows: now operates correctly on Windows 7
+* Windows: can now see and report symlinks and junction points
+* Windows: fixed potential deadlock in trigger deletion
+* Windows: fixed stack trace rendering on win32
+* Windows: improved IO scheduling around deletes on win32
+* Windows: improved handling of case insensitive win32 driver letters
+* pywatchman: the python wheel format is used for publishing watchman pypi package
+* pywatchman: now watchman path is configurable in python client
+* pywatchman: now python client can be used as a context manager
+* Solaris: support for Solaris has been removed. If you'd like to commit to
+  testing and maintaining Solaris support, we'd love to hear from you!
+
+### Watchman 4.8.0 (never formally released)
+
+Whoops, we never got around to tagging this beyond a release candidate tag!
+
+* New command `flush-subscriptions` to synchronize subscriptions associated
+  with the current session.
+* On Windows, return `/` as the directory separator.  Previously we used `\`.
+  This change should be pretty neutral for clients, and makes it easier to work
+  with both the internals and the integration test infrastructure.
+* Enforce socket Unix groups more strongly — Watchman will now refuse to start
+  if it couldn't gain the right group memberships, as can happen for sites that
+  are experiencing intermittent LDAP connectivity problems.
+* pywatchman now officially supports Python 3. pywatchman will return Unicode
+  strings (possibly with surrogate escapes) by default, but can optionally return
+  bytestrings. Note that on Python 3, pywatchman requires Watchman 4.8 and above.
+  The Python 2 interface and requirements remain unchanged.
+* Prior to 4.8, methods on the Java WatchmanClient that returned
+	ListenableFutures would swallow exceptions and hang in an unfinished state
+	under situations like socket closure or thread death.  This has been fixed, and
+	now ListenableFutures propagate exception conditions immediately.  (Note that
+	this is typically unrecoverable, and users should create a new WatchmanClient
+	to re-establish communication with Watchman.)  See #412.
+* The minimum Java version for the Watchman Java client has always been 1.7,
+	but it was incorrectly described to be 1.6.  The Java client's build file has
+	been fixed accordingly.
+* Watchman was converted from C to C++.  The conversion exposed several
+	concurrency bugs, all of which have now been fixed.
+* Subscription queries are now executed in the context of the client thread,
+	which means that subscriptions are dispatched in parallel.  Previously,
+	subscriptions would be serially dispatched and block the disk IO thread.
+* Triggers are now dispatched in parallel and waits are managed in their own
+	threads (one thread per trigger).  This improves concurrency and resolves a
+	couple of waitpid related issues where watchman may not reap spawned children
+	in a timely fashion, or may spin on CPU until another child is spawned.
+* Fixed an object lifecycle management issue that could cause a crash when
+  aging out old/transient files.
+* Implement an upgraded wire protocol, BSERv2, on the server and in pywatchman.
+	BSERv2 can carry information about string encoding over the wire. This lets
+	pywatchman convert to Unicode strings on Python 3. Clients and servers know how
+	to  transparently fall back to BSERv1.
+* OS X: we no longer use socket activation when registering with launchd.
+  This was the source of some upgrade problems for mac Homebrew users.
 
 ### Watchman 4.7.0 (2016-09-10)
 
@@ -36,13 +144,13 @@ GitHub](https://github.com/facebook/watchman/commits/master).
 
 * Improved I/O scheduling when processing recursive deletes and deep directory
   rename operations.
-* Improved performance of the `ignore_dirs` configuration option on macOS and
+* Improved performance of the `ignore_dirs` configuration option on OS X and
   Windows systems.  We take advantage of an undocumented (but supported!)
   API to further accelerate this for the first 8 entries in the `ignore_dirs`
-  on macOS.  Users that depend on this configuration to avoid recrawls will
+  on OS X.  Users that depend on this configuration to avoid recrawls will
   want to review and prioritize their most active build dirs to the front
   of the `ignore_dirs` specified in their `.watchmanconfig` file.
-* Added an optional recrawl recovery strategy for macOS that will attempt to
+* Added an optional recrawl recovery strategy for OS X that will attempt to
   resync from the fseventsd journal rather than performing a full filesystem
   walk.  This is currently disabled by default but will likely be enabled
   by default in the next Watchman release.  You can enable this by setting
@@ -52,7 +160,7 @@ GitHub](https://github.com/facebook/watchman/commits/master).
   large trees.
 * Fixed accidental exponential time complexity issue with recursive deletes
   and deep directory rename operations on case-insensitive filesystems (such as
-  macOS).  This manifested as high CPU utilization for extended periods of time.
+  OS X).  This manifested as high CPU utilization for extended periods of time.
 * Added support for allowing non-owner access to a Watchman instance.  Only
   the owner is authorized to create or delete watches.  Non-owners can view
   information about existing watches.  Access control is based on unix domain

@@ -2,178 +2,149 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+using watchman::CaseSensitivity;
 
-struct name_data {
-  w_string_t *name;
-  w_ht_t *map;
-  bool caseless;
+class NameExpr : public QueryExpr {
+  w_string name;
+  std::unordered_set<w_string> set;
+  CaseSensitivity caseSensitive;
   bool wholename;
+  explicit NameExpr(
+      std::unordered_set<w_string>&& set,
+      CaseSensitivity caseSensitive,
+      bool wholename)
+      : set(std::move(set)),
+        caseSensitive(caseSensitive),
+        wholename(wholename) {}
+
+ public:
+  EvaluateResult evaluate(struct w_query_ctx* ctx, FileResult* file) override {
+    if (!set.empty()) {
+      bool matched;
+      w_string str;
+
+      if (wholename) {
+        str = w_query_ctx_get_wholename(ctx);
+        if (caseSensitive == CaseSensitivity::CaseInSensitive) {
+          str = str.piece().asLowerCase();
+        }
+      } else {
+        str = caseSensitive == CaseSensitivity::CaseInSensitive
+            ? file->baseName().asLowerCase()
+            : file->baseName().asWString();
+      }
+
+      matched = set.find(str) != set.end();
+
+      return matched;
+    }
+
+    w_string_piece str;
+
+    if (wholename) {
+      str = w_query_ctx_get_wholename(ctx);
+    } else {
+      str = file->baseName();
+    }
+
+    if (caseSensitive == CaseSensitivity::CaseInSensitive) {
+      return w_string_equal_caseless(str, name);
+    }
+    return str == name;
+  }
+
+  static std::unique_ptr<QueryExpr>
+  parse(w_query*, const json_ref& term, CaseSensitivity caseSensitive) {
+    const char *pattern = nullptr, *scope = "basename";
+    const char* which =
+        caseSensitive == CaseSensitivity::CaseInSensitive ? "iname" : "name";
+    std::unordered_set<w_string> set;
+
+    if (!term.isArray()) {
+      throw QueryParseError("Expected array for '", which, "' term");
+    }
+
+    if (json_array_size(term) > 3) {
+      throw QueryParseError(
+          "Invalid number of arguments for '", which, "' term");
+    }
+
+    if (json_array_size(term) == 3) {
+      const auto& jscope = term.at(2);
+      if (!jscope.isString()) {
+        throw QueryParseError("Argument 3 to '", which, "' must be a string");
+      }
+
+      scope = json_string_value(jscope);
+
+      if (strcmp(scope, "basename") && strcmp(scope, "wholename")) {
+        throw QueryParseError(
+            "Invalid scope '", scope, "' for ", which, " expression");
+      }
+    }
+
+    const auto& name = term.at(1);
+
+    if (name.isArray()) {
+      uint32_t i;
+
+      for (i = 0; i < json_array_size(name); i++) {
+        if (!json_array_get(name, i).isString()) {
+          throw QueryParseError(
+              "Argument 2 to '",
+              which,
+              "' must be either a string or an array of string");
+        }
+      }
+
+      set.reserve(json_array_size(name));
+      for (i = 0; i < json_array_size(name); i++) {
+        w_string element;
+        const auto& jele = name.at(i);
+        auto ele = json_to_w_string(jele);
+
+        if (caseSensitive == CaseSensitivity::CaseInSensitive) {
+          element = ele.piece().asLowerCase(ele.type()).normalizeSeparators();
+        } else {
+          element = ele.normalizeSeparators();
+        }
+
+        set.insert(element);
+      }
+
+    } else if (name.isString()) {
+      pattern = json_string_value(name);
+    } else {
+      throw QueryParseError(
+          "Argument 2 to '",
+          which,
+          "' must be either a string or an array of string");
+    }
+
+    auto data = new NameExpr(
+        std::move(set), caseSensitive, !strcmp(scope, "wholename"));
+
+    if (pattern) {
+      data->name = json_to_w_string(name).normalizeSeparators();
+    }
+
+    return std::unique_ptr<QueryExpr>(data);
+  }
+
+  static std::unique_ptr<QueryExpr> parseName(
+      w_query* query,
+      const json_ref& term) {
+    return parse(query, term, query->case_sensitive);
+  }
+  static std::unique_ptr<QueryExpr> parseIName(
+      w_query* query,
+      const json_ref& term) {
+    return parse(query, term, CaseSensitivity::CaseInSensitive);
+  }
 };
 
-static bool eval_name(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  auto name = (name_data*)data;
-  w_string_t *str;
-
-  if (name->wholename) {
-    str = w_query_ctx_get_wholename(ctx);
-  } else {
-    str = w_file_get_name(file);
-  }
-
-  if (name->map) {
-    bool matched;
-    w_ht_val_t val;
-
-    if (name->caseless) {
-      str = w_string_dup_lower(str);
-      if (!str) {
-        return false;
-      }
-    }
-
-    matched = w_ht_lookup(name->map, w_ht_ptr_val(str), &val, false);
-
-    if (name->caseless) {
-      w_string_delref(str);
-    }
-
-    return matched;
-  }
-
-  if (name->caseless) {
-    return w_string_equal_caseless(str, name->name);
-  }
-  return w_string_equal(str, name->name);
-}
-
-static void dispose_name(void *data)
-{
-  auto name = (name_data*)data;
-
-  if (name->map) {
-    w_ht_free(name->map);
-  }
-  if (name->name) {
-    w_string_delref(name->name);
-  }
-  free(name);
-}
-
-static w_query_expr *name_parser_inner(w_query *query,
-    json_t *term, bool caseless)
-{
-  const char *pattern = NULL, *scope = "basename";
-  const char *which = caseless ? "iname" : "name";
-  struct name_data *data;
-  json_t *name;
-  w_ht_t *map = NULL;
-
-  if (!json_is_array(term)) {
-    ignore_result(asprintf(&query->errmsg, "Expected array for '%s' term",
-        which));
-    return NULL;
-  }
-
-  if (json_array_size(term) > 3) {
-    ignore_result(asprintf(&query->errmsg,
-        "Invalid number of arguments for '%s' term",
-        which));
-    return NULL;
-  }
-
-  if (json_array_size(term) == 3) {
-    json_t *jscope;
-
-    jscope = json_array_get(term, 2);
-    if (!json_is_string(jscope)) {
-      ignore_result(asprintf(&query->errmsg,
-          "Argument 3 to '%s' must be a string",
-          which));
-      return NULL;
-    }
-
-    scope = json_string_value(jscope);
-
-    if (strcmp(scope, "basename") && strcmp(scope, "wholename")) {
-      ignore_result(asprintf(&query->errmsg,
-          "Invalid scope '%s' for %s expression",
-          scope, which));
-      return NULL;
-    }
-  }
-
-  name = json_array_get(term, 1);
-
-  if (json_is_array(name)) {
-    uint32_t i;
-
-    for (i = 0; i < json_array_size(name); i++) {
-      if (!json_is_string(json_array_get(name, i))) {
-        ignore_result(asprintf(&query->errmsg,
-          "Argument 2 to '%s' must be either a string or an array of string",
-          which));
-        return NULL;
-      }
-    }
-
-    map = w_ht_new((uint32_t)json_array_size(name), &w_ht_string_funcs);
-    for (i = 0; i < json_array_size(name); i++) {
-      w_string_t *element;
-      const char *ele;
-      const json_t *jele = json_array_get(name, i);
-      ele = json_string_value(jele);
-      // We need to make a copy of the string since we do in-place separator
-      // normalization on the paths.
-      if (caseless) {
-        element = w_string_new_lower_typed(ele, json_to_w_string(jele)->type);
-      } else {
-        element = w_string_new_typed(ele, json_to_w_string(jele)->type);
-      }
-
-      w_string_in_place_normalize_separators(&element, WATCHMAN_DIR_SEP);
-
-      w_ht_set(map, w_ht_ptr_val(element), 1);
-      w_string_delref(element);
-    }
-
-  } else if (json_is_string(name)) {
-    pattern = json_string_value(name);
-  } else {
-    ignore_result(asprintf(&query->errmsg,
-        "Argument 2 to '%s' must be either a string or an array of string",
-        which));
-    return NULL;
-  }
-
-
-  data = (name_data*)calloc(1, sizeof(*data));
-  if (pattern) {
-    // We need to make a copy of the string since we do in-place separator
-    // normalization on the paths.
-    data->name = w_string_new_typed(pattern, json_to_w_string(name)->type);
-    w_string_in_place_normalize_separators(&data->name, WATCHMAN_DIR_SEP);
-  }
-  data->map = map;
-  data->caseless = caseless;
-  data->wholename = !strcmp(scope, "wholename");
-
-  return w_query_expr_new(eval_name, dispose_name, data);
-}
-
-static w_query_expr *name_parser(w_query *query, json_t *term)
-{
-  return name_parser_inner(query, term, !query->case_sensitive);
-}
-W_TERM_PARSER("name", name_parser)
-
-static w_query_expr *iname_parser(w_query *query, json_t *term)
-{
-  return name_parser_inner(query, term, true);
-}
-W_TERM_PARSER("iname", iname_parser)
+W_TERM_PARSER("name", NameExpr::parseName)
+W_TERM_PARSER("iname", NameExpr::parseIName)
 
 /* vim:ts=2:sw=2:et:
  */

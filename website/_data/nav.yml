@@ -1,9 +1,9 @@
 - title: Docs
-  href: docs/install.html
+  href: /watchman/docs/install.html
   category: docs
 
 - title: Support
-  href: support.html
+  href: /watchman/support.html
   category: support
 
 #- title: Blog

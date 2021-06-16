@@ -7,6 +7,8 @@
   - id: cli-options
   - id: watchman-make
   - id: watchman-wait
+  - id: watchman-replicate-subscription
+  - id: cppclient
   - id: nodejs
   - id: config
   - id: socket-interface
@@ -18,6 +20,7 @@
   items:
   - id: cmd.clock
   - id: cmd.find
+  - id: cmd.flush-subscriptions
   - id: cmd.get-config
   - id: cmd.get-sockname
   - id: cmd.list-capabilities
@@ -44,6 +47,7 @@
   - id: clockspec
   - id: file-query
   - id: simple-query
+  - id: scm-query
 - title: Expression Terms
   items:
   - id: expr.allof

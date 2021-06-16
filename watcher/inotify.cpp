@@ -2,420 +2,426 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include <folly/String.h>
+#include <folly/Synchronized.h>
+#include <folly/experimental/LockFreeRingBuffer.h>
+#include <atomic>
+#include "FileDescriptor.h"
+#include "InMemoryView.h"
+#include "Pipe.h"
+#include "watchman_error_category.h"
 
 #ifdef HAVE_INOTIFY_INIT
+
+using namespace watchman;
+using watchman::FileDescriptor;
+using watchman::inotify_category;
+using watchman::Pipe;
 
 #ifndef IN_EXCL_UNLINK
 /* defined in <linux/inotify.h> but we can't include that without
  * breaking userspace */
-# define WATCHMAN_IN_EXCL_UNLINK 0x04000000
+#define WATCHMAN_IN_EXCL_UNLINK 0x04000000
 #else
-# define WATCHMAN_IN_EXCL_UNLINK IN_EXCL_UNLINK
+#define WATCHMAN_IN_EXCL_UNLINK IN_EXCL_UNLINK
 #endif
 
-#define WATCHMAN_INOTIFY_MASK \
-  IN_ATTRIB | IN_CREATE | IN_DELETE | \
-  IN_DELETE_SELF | IN_MODIFY | IN_MOVE_SELF | IN_MOVED_FROM | \
-  IN_MOVED_TO | IN_DONT_FOLLOW | IN_ONLYDIR | WATCHMAN_IN_EXCL_UNLINK
+#define WATCHMAN_INOTIFY_MASK                                       \
+  IN_ATTRIB | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY |  \
+      IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_DONT_FOLLOW | \
+      IN_ONLYDIR | WATCHMAN_IN_EXCL_UNLINK
 
-static const struct flag_map inflags[] = {
-  {IN_ACCESS, "IN_ACCESS"},
-  {IN_MODIFY, "IN_MODIFY"},
-  {IN_ATTRIB, "IN_ATTRIB"},
-  {IN_CLOSE_WRITE, "IN_CLOSE_WRITE"},
-  {IN_CLOSE_NOWRITE, "IN_CLOSE_NOWRITE"},
-  {IN_OPEN, "IN_OPEN"},
-  {IN_MOVED_FROM, "IN_MOVED_FROM"},
-  {IN_MOVED_TO, "IN_MOVED_TO"},
-  {IN_CREATE, "IN_CREATE"},
-  {IN_DELETE, "IN_DELETE"},
-  {IN_DELETE_SELF, "IN_DELETE_SELF"},
-  {IN_MOVE_SELF, "IN_MOVE_SELF"},
-  {IN_UNMOUNT, "IN_UNMOUNT"},
-  {IN_Q_OVERFLOW, "IN_Q_OVERFLOW"},
-  {IN_IGNORED, "IN_IGNORED"},
-  {IN_ISDIR, "IN_ISDIR"},
-  {0, NULL},
+namespace {
+
+const struct flag_map inflags[] = {
+    {IN_ACCESS, "IN_ACCESS"},
+    {IN_MODIFY, "IN_MODIFY"},
+    {IN_ATTRIB, "IN_ATTRIB"},
+    {IN_CLOSE_WRITE, "IN_CLOSE_WRITE"},
+    {IN_CLOSE_NOWRITE, "IN_CLOSE_NOWRITE"},
+    {IN_OPEN, "IN_OPEN"},
+    {IN_MOVED_FROM, "IN_MOVED_FROM"},
+    {IN_MOVED_TO, "IN_MOVED_TO"},
+    {IN_CREATE, "IN_CREATE"},
+    {IN_DELETE, "IN_DELETE"},
+    {IN_DELETE_SELF, "IN_DELETE_SELF"},
+    {IN_MOVE_SELF, "IN_MOVE_SELF"},
+    {IN_UNMOUNT, "IN_UNMOUNT"},
+    {IN_Q_OVERFLOW, "IN_Q_OVERFLOW"},
+    {IN_IGNORED, "IN_IGNORED"},
+    {IN_ISDIR, "IN_ISDIR"},
+    {0, nullptr},
 };
 
 struct pending_move {
-  time_t created;
-  w_string_t *name;
+  std::chrono::system_clock::time_point created;
+  w_string name;
+
+  pending_move(
+      std::chrono::system_clock::time_point created,
+      const w_string& name)
+      : created(created), name(name) {}
 };
 
-struct inot_root_state {
-  /* we use one inotify instance per watched root dir */
-  int infd;
+/**
+ * Memory-efficient records for debugging inotify events after the fact.
+ */
+struct InotifyLogEntry {
+  // 52 should cover many filenames.
+  static constexpr size_t kNameLength = 52;
 
-  /* map of active watch descriptor to name of the corresponding dir */
-  w_ht_t *wd_to_name;
-  /* map of inotify cookie to corresponding name */
-  w_ht_t *move_map;
-  /* lock to protect both of the maps above */
-  pthread_mutex_t lock;
+  InotifyLogEntry() = default;
+
+  explicit InotifyLogEntry(inotify_event* evt) noexcept {
+    wd = evt->wd;
+    mask = evt->mask;
+    cookie = evt->cookie;
+
+    // If evt->len is nonzero, evt->name is a null-terminated string.
+    bool has_name = evt->len > 0;
+    if (has_name) {
+      auto piece = w_string_piece{evt->name}; // Evaluate strlen here.
+      storeTruncatedHead(name, piece);
+    } else {
+      name[0] = 0;
+    }
+  }
+
+  json_ref asJsonValue() {
+    size_t length = strnlen(name, kNameLength);
+    auto namePiece = w_string_piece{name, length};
+
+    return json_object({
+        {"wd", json_integer(wd)},
+        {"mask", json_integer(mask)},
+        {"cookie", json_integer(cookie)},
+        {"name", typed_string_to_json(namePiece.asWString())},
+    });
+  }
+
+  w_string_piece namePiece() const {
+    size_t length = strnlen(name, kNameLength);
+    return w_string_piece{name, length};
+  }
+
+  int wd;
+  uint32_t mask;
+  uint32_t cookie;
+  // Will end with ... if truncated. May not be null-terminated.
+  char name[kNameLength];
+};
+static_assert(64 == sizeof(InotifyLogEntry));
+
+} // namespace
+
+struct InotifyWatcher : public Watcher {
+  /* we use one inotify instance per watched root dir */
+  FileDescriptor infd;
+  Pipe terminatePipe_;
+
+  /**
+   * If not null, holds a fixed-size ring of the last `inotify_ring_log_size`
+   * inotify events.
+   */
+  std::unique_ptr<folly::LockFreeRingBuffer<InotifyLogEntry>> ringBuffer_;
+
+  /**
+   * Incremented by consumeNotify, which only runs on one thread.
+   */
+  uint64_t totalEventsSeen_ = 0;
+
+  /**
+   * Published from consumeNotify so getDebugInfo can read a recent value.
+   */
+  std::atomic<uint64_t> totalEventsSeenAtomic_ = 0;
+
+  struct maps {
+    /* map of active watch descriptor to name of the corresponding dir */
+    std::unordered_map<int, w_string> wd_to_name;
+    /* map of inotify cookie to corresponding name */
+    std::unordered_map<uint32_t, pending_move> move_map;
+  };
+
+  folly::Synchronized<maps> maps;
 
   // Make the buffer big enough for 16k entries, which
   // happens to be the default fs.inotify.max_queued_events
-  char ibuf[WATCHMAN_BATCH_LIMIT * (sizeof(struct inotify_event) + 256)];
+  char ibuf
+      [WATCHMAN_BATCH_LIMIT * (sizeof(struct inotify_event) + (NAME_MAX + 1))];
+
+  explicit InotifyWatcher(watchman_root* root);
+
+  std::unique_ptr<watchman_dir_handle> startWatchDir(
+      const std::shared_ptr<watchman_root>& root,
+      struct watchman_dir* dir,
+      const char* path) override;
+
+  Watcher::ConsumeNotifyRet consumeNotify(
+      const std::shared_ptr<watchman_root>& root,
+      PendingChanges& coll) override;
+
+  bool waitNotify(int timeoutms) override;
+
+  // Process a single inotify event and add it to the pending collection if
+  // needed. Returns true if the root directory was removed and the watch needs
+  // to be cancelled.
+  bool process_inotify_event(
+      const std::shared_ptr<watchman_root>& root,
+      PendingChanges& coll,
+      struct inotify_event* ine,
+      std::chrono::system_clock::time_point now);
+
+  void signalThreads() override;
+
+  json_ref getDebugInfo() override;
 };
 
-static w_ht_val_t copy_pending(w_ht_val_t key) {
-  auto src = (pending_move*)w_ht_val_ptr(key);
-  struct pending_move *dest = (pending_move*)malloc(sizeof(*dest));
-  dest->created = src->created;
-  dest->name = src->name;
-  w_string_addref(src->name);
-  return w_ht_ptr_val(dest);
-}
-
-static void del_pending(w_ht_val_t key) {
-  auto p = (pending_move*)w_ht_val_ptr(key);
-
-  w_string_delref(p->name);
-  free(p);
-}
-
-static const struct watchman_hash_funcs move_hash_funcs = {
-  NULL, // copy_key
-  NULL, // del_key
-  NULL, // equal_key
-  NULL, // hash_key
-  copy_pending, // copy_val
-  del_pending   // del_val
-};
-
-static const char *inot_strerror(int err) {
-  switch (err) {
-    case EMFILE:
-      return "The user limit on the total number of inotify "
-        "instances has been reached; increase the "
-        "fs.inotify.max_user_instances sysctl";
-    case ENFILE:
-      return "The system limit on the total number of file descriptors "
-        "has been reached";
-    case ENOMEM:
-      return "Insufficient kernel memory is available";
-    case ENOSPC:
-      return "The user limit on the total number of inotify watches "
-        "was reached; increase the fs.inotify.max_user_watches sysctl";
-    default:
-      return strerror(err);
-  }
-}
-
-bool inot_root_init(w_root_t *root, char **errmsg) {
-  struct inot_root_state *state;
-
-
-  state = (inot_root_state*)calloc(1, sizeof(*state));
-  if (!state) {
-    *errmsg = strdup("out of memory");
-    return false;
-  }
-  root->inner.watch = state;
-  pthread_mutex_init(&state->lock, NULL);
-
+InotifyWatcher::InotifyWatcher(watchman_root* root)
+    : Watcher("inotify", WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
 #ifdef HAVE_INOTIFY_INIT1
-  state->infd = inotify_init1(IN_CLOEXEC);
+  infd = FileDescriptor(
+      inotify_init1(IN_CLOEXEC), FileDescriptor::FDType::Generic);
 #else
-  state->infd = inotify_init();
+  infd = FileDescriptor(inotify_init(), FileDescriptor::FDType::Generic);
 #endif
-  if (state->infd == -1) {
-    ignore_result(asprintf(
-        errmsg,
-        "watch(%s): inotify_init error: %s",
-        root->root_path.c_str(),
-        inot_strerror(errno)));
-    w_log(W_LOG_ERR, "%s\n", *errmsg);
-    return false;
+  if (infd.fd() == -1) {
+    throw std::system_error(errno, inotify_category(), "inotify_init");
   }
-  w_set_cloexec(state->infd);
-  state->wd_to_name =
-      w_ht_new(cfg_get_int(root, CFG_HINT_NUM_DIRS, HINT_NUM_DIRS),
-               &w_ht_string_val_funcs);
-  state->move_map = w_ht_new(2, &move_hash_funcs);
+  infd.setCloExec();
 
-  return true;
-}
-
-void inot_root_dtor(w_root_t *root) {
-  auto state = (inot_root_state*)root->inner.watch;
-
-  if (!state) {
-    return;
+  {
+    auto wlock = maps.wlock();
+    wlock->wd_to_name.reserve(
+        root->config.getInt(CFG_HINT_NUM_DIRS, HINT_NUM_DIRS));
   }
 
-  pthread_mutex_destroy(&state->lock);
-
-  close(state->infd);
-  state->infd = -1;
-  if (state->wd_to_name) {
-    w_ht_free(state->wd_to_name);
-    state->wd_to_name = NULL;
+  json_int_t inotify_ring_log_size =
+      root->config.getInt("inotify_ring_log_size", 0);
+  if (inotify_ring_log_size) {
+    ringBuffer_ = std::make_unique<folly::LockFreeRingBuffer<InotifyLogEntry>>(
+        inotify_ring_log_size);
   }
-  if (state->move_map) {
-    w_ht_free(state->move_map);
-    state->move_map = NULL;
-  }
-
-  free(state);
-  root->inner.watch = NULL;
 }
 
-static void inot_root_signal_threads(w_root_t *root) {
-  unused_parameter(root);
-}
-
-static bool inot_root_start(w_root_t *root) {
-  unused_parameter(root);
-
-  return true;
-}
-
-static bool inot_root_start_watch_file(struct write_locked_watchman_root *lock,
-                                       struct watchman_file *file) {
-  unused_parameter(lock);
-  unused_parameter(file);
-  return true;
-}
-
-static void inot_root_stop_watch_file(struct write_locked_watchman_root *lock,
-                                      struct watchman_file *file) {
-  unused_parameter(lock);
-  unused_parameter(file);
-}
-
-static struct watchman_dir_handle *
-inot_root_start_watch_dir(struct write_locked_watchman_root *lock,
-                          struct watchman_dir *dir, struct timeval now,
-                          const char *path) {
-  auto state = (inot_root_state*)lock->root->inner.watch;
-  struct watchman_dir_handle *osdir = NULL;
-  int newwd, err;
-
+std::unique_ptr<watchman_dir_handle> InotifyWatcher::startWatchDir(
+    const std::shared_ptr<watchman_root>&,
+    struct watchman_dir*,
+    const char* path) {
   // Carry out our very strict opendir first to ensure that we're not
   // traversing symlinks in the context of this root
-  osdir = w_dir_open(path);
-  if (!osdir) {
-    handle_open_errno(lock, dir, now, "opendir", errno, NULL);
-    return NULL;
-  }
+  auto osdir = w_dir_open(path);
 
   w_string dir_name(path, W_STRING_BYTE);
 
   // The directory might be different since the last time we looked at it, so
   // call inotify_add_watch unconditionally.
-  newwd = inotify_add_watch(state->infd, path, WATCHMAN_INOTIFY_MASK);
+  int newwd = inotify_add_watch(infd.fd(), path, WATCHMAN_INOTIFY_MASK);
   if (newwd == -1) {
-    err = errno;
-    if (errno == ENOSPC || errno == ENOMEM) {
-      // Limits exceeded, no recovery from our perspective
-      set_poison_state(dir_name, now, "inotify-add-watch", errno,
-                       inot_strerror(errno));
-    } else {
-      handle_open_errno(lock, dir, now, "inotify_add_watch", errno,
-          inot_strerror(errno));
-    }
-    w_dir_close(osdir);
-    errno = err;
-    return NULL;
+    int err = errno;
+    throw std::system_error(err, inotify_category(), "inotify_add_watch");
   }
 
   // record mapping
-  pthread_mutex_lock(&state->lock);
-  w_ht_replace(state->wd_to_name, newwd, w_ht_ptr_val(dir_name));
-  pthread_mutex_unlock(&state->lock);
-  w_log(W_LOG_DBG, "adding %d -> %s mapping\n", newwd, path);
+  {
+    auto wlock = maps.wlock();
+    wlock->wd_to_name[newwd] = dir_name;
+  }
+  logf(DBG, "adding {} -> {} mapping\n", newwd, path);
 
   return osdir;
 }
 
-static void inot_root_stop_watch_dir(struct write_locked_watchman_root *lock,
-                                     struct watchman_dir *dir) {
-  unused_parameter(lock);
-  unused_parameter(dir);
-
-  // Linux removes watches for us at the appropriate times,
-  // and tells us about it via inotify, so we have nothing to do here
-}
-
-static void process_inotify_event(
-    w_root_t *root,
-    struct watchman_pending_collection *coll,
-    struct inotify_event *ine,
-    struct timeval now)
-{
-  auto state = (inot_root_state*)root->inner.watch;
+bool InotifyWatcher::process_inotify_event(
+    const std::shared_ptr<watchman_root>& root,
+    PendingChanges& coll,
+    struct inotify_event* ine,
+    std::chrono::system_clock::time_point now) {
   char flags_label[128];
-
   w_expand_flags(inflags, ine->mask, flags_label, sizeof(flags_label));
-  w_log(W_LOG_DBG, "notify: wd=%d mask=0x%x %s %s\n", ine->wd, ine->mask,
-      flags_label, ine->len > 0 ? ine->name : "");
+
+  logf(
+      DBG,
+      "notify: wd={} mask={:x} {} {}\n",
+      ine->wd,
+      ine->mask,
+      flags_label,
+      ine->len > 0 ? ine->name : "");
+
+  if (ringBuffer_) {
+    ringBuffer_->write(InotifyLogEntry{ine});
+  }
 
   if (ine->wd == -1 && (ine->mask & IN_Q_OVERFLOW)) {
     /* we missed something, will need to re-crawl */
-    w_root_schedule_recrawl(root, "IN_Q_OVERFLOW");
+    root->scheduleRecrawl("IN_Q_OVERFLOW");
   } else if (ine->wd != -1) {
-    w_string_t *name = NULL;
+    w_string name;
     char buf[WATCHMAN_NAME_MAX];
     int pending_flags = W_PENDING_VIA_NOTIFY;
+    w_string dir_name;
 
-    pthread_mutex_lock(&state->lock);
-    auto dir_name = (w_string_t*)w_ht_val_ptr(w_ht_get(state->wd_to_name, ine->wd));
-    if (dir_name) {
-      w_string_addref(dir_name);
+    {
+      auto rlock = maps.rlock();
+      auto it = rlock->wd_to_name.find(ine->wd);
+      if (it != rlock->wd_to_name.end()) {
+        dir_name = it->second;
+      }
     }
-    pthread_mutex_unlock(&state->lock);
 
     if (dir_name) {
       if (ine->len > 0) {
-        snprintf(buf, sizeof(buf), "%.*s/%s",
-            dir_name->len, dir_name->buf,
+        snprintf(
+            buf,
+            sizeof(buf),
+            "%.*s/%s",
+            int(dir_name.size()),
+            dir_name.data(),
             ine->name);
-        name = w_string_new_typed(buf, W_STRING_BYTE);
+        name = w_string(buf, W_STRING_BYTE);
       } else {
         name = dir_name;
-        w_string_addref(name);
       }
     }
 
-    if (ine->len > 0 && (ine->mask & (IN_MOVED_FROM|IN_ISDIR))
-        == (IN_MOVED_FROM|IN_ISDIR)) {
-      struct pending_move mv;
-
+    if (ine->len > 0 &&
+        (ine->mask & (IN_MOVED_FROM | IN_ISDIR)) ==
+            (IN_MOVED_FROM | IN_ISDIR)) {
       // record this as a pending move, so that we can automatically
       // watch the target when we get the other side of it.
-      mv.created = now.tv_sec;
-      mv.name = name;
-
-      pthread_mutex_lock(&state->lock);
-      if (!w_ht_replace(state->move_map, ine->cookie, w_ht_ptr_val(&mv))) {
-        w_log(W_LOG_FATAL,
-            "failed to store %" PRIx32 " -> %s in move map\n",
-            ine->cookie, name->buf);
+      {
+        auto wlock = maps.wlock();
+        wlock->move_map.emplace(ine->cookie, pending_move(now, name));
       }
-      pthread_mutex_unlock(&state->lock);
 
-      w_log(W_LOG_DBG,
-          "recording move_from %" PRIx32 " %s\n", ine->cookie,
-          name->buf);
+      log(DBG, "recording move_from ", ine->cookie, " ", name, "\n");
     }
 
-    if (ine->len > 0 && (ine->mask & (IN_MOVED_TO|IN_ISDIR))
-        == (IN_MOVED_FROM|IN_ISDIR)) {
-      pthread_mutex_lock(&state->lock);
-      auto old =
-          (pending_move*)w_ht_val_ptr(w_ht_get(state->move_map, ine->cookie));
-      if (old) {
-        int wd = inotify_add_watch(state->infd, name->buf,
-                    WATCHMAN_INOTIFY_MASK);
+    if (ine->len > 0 &&
+        (ine->mask & (IN_MOVED_TO | IN_ISDIR)) == (IN_MOVED_FROM | IN_ISDIR)) {
+      auto wlock = maps.wlock();
+      auto it = wlock->move_map.find(ine->cookie);
+      if (it != wlock->move_map.end()) {
+        auto& old = it->second;
+        int wd =
+            inotify_add_watch(infd.fd(), name.c_str(), WATCHMAN_INOTIFY_MASK);
         if (wd == -1) {
           if (errno == ENOSPC || errno == ENOMEM) {
             // Limits exceeded, no recovery from our perspective
-            set_poison_state(name, now, "inotify-add-watch", errno,
-                inot_strerror(errno));
+            set_poison_state(
+                name,
+                now,
+                "inotify-add-watch",
+                std::error_code(errno, inotify_category()));
           } else {
-            w_log(W_LOG_DBG, "add_watch: %s %s\n",
-                name->buf, inot_strerror(errno));
+            watchman::log(
+                watchman::DBG,
+                "add_watch: ",
+                name,
+                " ",
+                inotify_category().message(errno),
+                "\n");
           }
         } else {
-          w_log(W_LOG_DBG, "moved %s -> %s\n", old->name->buf, name->buf);
-          w_ht_replace(state->wd_to_name, wd, w_ht_ptr_val(name));
+          logf(DBG, "moved {} -> {}\n", old.name.c_str(), name.c_str());
+          // TODO: assert that there is no entry in wd_to_name
+          wlock->wd_to_name[wd] = name;
         }
       } else {
-        w_log(W_LOG_DBG, "move: cookie=%" PRIx32 " not found in move map %s\n",
-            ine->cookie, name->buf);
+        logf(
+            DBG,
+            "move: cookie={:x} not found in move map {}\n",
+            ine->cookie,
+            name);
       }
-      pthread_mutex_unlock(&state->lock);
     }
 
     if (dir_name) {
-      if ((ine->mask & (IN_UNMOUNT|IN_IGNORED|IN_DELETE_SELF|IN_MOVE_SELF))) {
-        w_string_t *pname;
-
+      if ((ine->mask &
+           (IN_UNMOUNT | IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF))) {
         if (w_string_equal(root->root_path, name)) {
-          w_log(W_LOG_ERR,
-              "root dir %s has been (re)moved, canceling watch\n",
-              root->root_path.c_str());
-          w_string_delref(name);
-          w_string_delref(dir_name);
-          w_root_cancel(root);
-          return;
+          logf(
+              ERR,
+              "root dir {} has been (re)moved, canceling watch\n",
+              root->root_path);
+          return true;
         }
 
-        // We need to examine the parent and crawl down
-        pname = w_string_dirname(name);
-        w_log(W_LOG_DBG, "mask=%x, focus on parent: %.*s\n",
-            ine->mask, pname->len, pname->buf);
-        w_string_delref(name);
+        // We need to examine the parent and potentially crawl down
+        auto pname = name.dirName();
+        logf(DBG, "mask={:x}, focus on parent: {}\n", ine->mask, pname);
         name = pname;
+      }
+
+      if (ine->mask & (IN_CREATE | IN_DELETE)) {
         pending_flags |= W_PENDING_RECURSIVE;
       }
 
-      if (ine->mask & (IN_CREATE|IN_DELETE)) {
-        pending_flags |= W_PENDING_RECURSIVE;
-      }
-
-      w_log(W_LOG_DBG, "add_pending for inotify mask=%x %.*s\n",
-          ine->mask, name->len, name->buf);
-      w_pending_coll_add(coll, name, now, pending_flags);
-
-      w_string_delref(name);
+      logf(
+          DBG,
+          "add_pending for inotify mask={:x} {}\n",
+          ine->mask,
+          name.c_str());
+      coll.add(name, now, pending_flags);
 
       // The kernel removed the wd -> name mapping, so let's update
       // our state here also
       if ((ine->mask & IN_IGNORED) != 0) {
-        w_log(W_LOG_DBG, "mask=%x: remove watch %d %.*s\n", ine->mask,
-            ine->wd, dir_name->len, dir_name->buf);
-        pthread_mutex_lock(&state->lock);
-        w_ht_del(state->wd_to_name, ine->wd);
-        pthread_mutex_unlock(&state->lock);
+        logf(
+            DBG,
+            "mask={:x}: remove watch {} {}\n",
+            ine->mask,
+            ine->wd,
+            dir_name);
+        auto wlock = maps.wlock();
+        wlock->wd_to_name.erase(ine->wd);
       }
 
-      w_string_delref(dir_name);
-
-    } else if ((ine->mask & (IN_MOVE_SELF|IN_IGNORED)) == 0) {
+    } else if ((ine->mask & (IN_MOVE_SELF | IN_IGNORED)) == 0) {
       // If we can't resolve the dir, and this isn't notification
       // that it has gone away, then we want to recrawl to fix
       // up our state.
-      w_log(W_LOG_ERR, "wanted dir %d for mask %x but not found %.*s\n",
-          ine->wd, ine->mask, ine->len, ine->name);
-      w_root_schedule_recrawl(root, "dir missing from internal state");
+      logf(
+          ERR,
+          "wanted dir {} for mask {:x} but not found {}\n",
+          ine->wd,
+          ine->mask,
+          ine->name);
+      root->scheduleRecrawl("dir missing from internal state");
     }
   }
+  return false;
 }
 
-static bool inot_root_consume_notify(w_root_t *root,
-    struct watchman_pending_collection *coll)
-{
-  auto state = (inot_root_state*)root->inner.watch;
-  struct inotify_event *ine;
-  char *iptr;
-  int n;
-  struct timeval now;
-
-  n = read(state->infd, &state->ibuf, sizeof(state->ibuf));
+Watcher::ConsumeNotifyRet InotifyWatcher::consumeNotify(
+    const std::shared_ptr<watchman_root>& root,
+    PendingChanges& coll) {
+  int n = read(infd.fd(), &ibuf, sizeof(ibuf));
   if (n == -1) {
     if (errno == EINTR) {
-      return false;
+      return {false, false};
     }
-    w_log(W_LOG_FATAL, "read(%d, %zu): error %s\n",
-        state->infd, sizeof(state->ibuf), strerror(errno));
+    logf(
+        FATAL,
+        "read({}, {}): error {}\n",
+        infd.fd(),
+        sizeof(ibuf),
+        folly::errnoStr(errno));
   }
 
-  w_log(W_LOG_DBG, "inotify read: returned %d.\n", n);
-  gettimeofday(&now, NULL);
+  logf(DBG, "inotify read: returned {}.\n", n);
+  auto now = std::chrono::system_clock::now();
 
-  for (iptr = state->ibuf; iptr < state->ibuf + n;
-      iptr = iptr + sizeof(*ine) + ine->len) {
+  struct inotify_event* ine;
+  bool cancel = false;
+  for (char* iptr = ibuf; iptr < ibuf + n; iptr += sizeof(*ine) + ine->len) {
     ine = (struct inotify_event*)iptr;
 
-    process_inotify_event(root, coll, ine, now);
-
-    if (root->inner.cancelled) {
-      return false;
-    }
+    cancel |= process_inotify_event(root, coll, ine, now);
+    ++totalEventsSeen_;
   }
+
+  // Relaxed because we don't really care exactly when the value is visible.
+  totalEventsSeenAtomic_.store(totalEventsSeen_, std::memory_order_relaxed);
 
   // It is possible that we can accumulate a set of pending_move
   // structs in move_map.  This happens when a directory is moved
@@ -426,49 +432,90 @@ static bool inot_root_consume_notify(w_root_t *root,
   // the MOVE_TO may yet be waiting to read in another go around.
   // We allow a somewhat arbitrary but practical grace period to
   // observe the corresponding MOVE_TO.
-  if (w_ht_size(state->move_map) > 0) {
-    w_ht_iter_t iter;
-    if (w_ht_first(state->move_map, &iter)) do {
-      auto pending = (pending_move*)w_ht_val_ptr(iter.value);
-      if (now.tv_sec - pending->created > 5 /* seconds */) {
-        w_log(W_LOG_DBG,
-            "deleting pending move %s (moved outside of watch?)\n",
-            pending->name->buf);
-        w_ht_iter_del(state->move_map, &iter);
+  {
+    auto wlock = maps.wlock();
+    auto it = wlock->move_map.begin();
+    while (it != wlock->move_map.end()) {
+      auto& pending = it->second;
+      if (now - pending.created > std::chrono::seconds{5}) {
+        logf(
+            DBG,
+            "deleting pending move {} (moved outside of watch?)\n",
+            pending.name);
+        it = wlock->move_map.erase(it);
+      } else {
+        ++it;
       }
-    } while (w_ht_next(state->move_map, &iter));
+    }
   }
 
-  return true;
+  return {true, cancel};
 }
 
-static bool inot_root_wait_notify(w_root_t *root, int timeoutms) {
-  auto state = (inot_root_state *)root->inner.watch;
-  int n;
-  struct pollfd pfd;
+bool InotifyWatcher::waitNotify(int timeoutms) {
+  struct pollfd pfd[2];
+  pfd[0].fd = infd.fd();
+  pfd[0].events = POLLIN;
+  pfd[1].fd = terminatePipe_.read.fd();
+  pfd[1].events = POLLIN;
 
-  pfd.fd = state->infd;
-  pfd.events = POLLIN;
+  int n = poll(pfd, std::size(pfd), timeoutms);
 
-  n = poll(&pfd, 1, timeoutms);
-
-  return n == 1;
+  if (n > 0) {
+    if (pfd[1].revents) {
+      // We were signalled via signalThreads
+      return false;
+    }
+    return pfd[0].revents != 0;
+  }
+  return false;
 }
 
-struct watchman_ops inotify_watcher = {
-  "inotify",
-  WATCHER_HAS_PER_FILE_NOTIFICATIONS,
-  inot_root_init,
-  inot_root_start,
-  inot_root_dtor,
-  inot_root_start_watch_file,
-  inot_root_stop_watch_file,
-  inot_root_start_watch_dir,
-  inot_root_stop_watch_dir,
-  inot_root_signal_threads,
-  inot_root_consume_notify,
-  inot_root_wait_notify,
-};
+void InotifyWatcher::signalThreads() {
+  ignore_result(write(terminatePipe_.write.fd(), "X", 1));
+}
+
+json_ref InotifyWatcher::getDebugInfo() {
+  json_ref events = json_null();
+  if (ringBuffer_) {
+    std::vector<InotifyLogEntry> entries;
+
+    auto head = ringBuffer_->currentHead();
+    if (head.moveBackward()) {
+      InotifyLogEntry entry;
+      while (ringBuffer_->tryRead(entry, head)) {
+        entries.push_back(std::move(entry));
+        if (!head.moveBackward()) {
+          break;
+        }
+      }
+    }
+    std::reverse(entries.begin(), entries.end());
+
+    events = json_array();
+    for (auto& entry : entries) {
+      json_array_append(events, entry.asJsonValue());
+    }
+  }
+  return json_object({
+      {"events", events},
+      {"total_event_count", json_integer(totalEventsSeenAtomic_.load())},
+  });
+}
+
+namespace {
+std::shared_ptr<watchman::QueryableView> detectInotify(watchman_root* root) {
+  if (is_edenfs_fs_type(root->fs_type)) {
+    // inotify is effectively O(repo) and we know that that access
+    // pattern is undesirable when running on top of EdenFS
+    throw std::runtime_error("cannot watch EdenFS file systems with inotify");
+  }
+  return std::make_shared<watchman::InMemoryView>(
+      root, std::make_shared<InotifyWatcher>(root));
+}
+} // namespace
+
+static WatcherRegistry reg("inotify", detectInotify);
 
 #endif // HAVE_INOTIFY_INIT
 

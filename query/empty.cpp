@@ -3,49 +3,54 @@
 
 #include "watchman.h"
 
-static bool eval_exists(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  unused_parameter(ctx);
-  unused_parameter(data);
+#include <memory>
 
-  return file->exists;
-}
+class ExistsExpr : public QueryExpr {
+ public:
+  EvaluateResult evaluate(struct w_query_ctx*, FileResult* file) override {
+    return file->exists();
+  }
 
-static w_query_expr *exists_parser(w_query *query, json_t *term)
-{
-  unused_parameter(query);
-  unused_parameter(term);
-  return w_query_expr_new(eval_exists, NULL, NULL);
-}
-W_TERM_PARSER("exists", exists_parser)
+  static std::unique_ptr<QueryExpr> parse(w_query*, const json_ref&) {
+    return std::make_unique<ExistsExpr>();
+  }
+};
+W_TERM_PARSER("exists", ExistsExpr::parse)
 
-static bool eval_empty(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  unused_parameter(ctx);
-  unused_parameter(data);
+class EmptyExpr : public QueryExpr {
+ public:
+  EvaluateResult evaluate(struct w_query_ctx*, FileResult* file) override {
+    auto exists = file->exists();
+    auto stat = file->stat();
+    auto size = file->size();
 
-  if (!file->exists) {
+    if (!exists.has_value()) {
+      return folly::none;
+    }
+    if (!exists.value()) {
+      return false;
+    }
+
+    if (!stat.has_value()) {
+      return folly::none;
+    }
+
+    if (!size.has_value()) {
+      return folly::none;
+    }
+
+    if (stat->isDir() || stat->isFile()) {
+      return size.value() == 0;
+    }
+
     return false;
   }
 
-  if (S_ISDIR(file->stat.mode) || S_ISREG(file->stat.mode)) {
-    return file->stat.size == 0;
+  static std::unique_ptr<QueryExpr> parse(w_query*, const json_ref&) {
+    return std::make_unique<EmptyExpr>();
   }
-
-  return false;
-}
-
-static w_query_expr *empty_parser(w_query *query, json_t *term)
-{
-  unused_parameter(query);
-  unused_parameter(term);
-  return w_query_expr_new(eval_empty, NULL, NULL);
-}
-W_TERM_PARSER("empty", empty_parser)
+};
+W_TERM_PARSER("empty", EmptyExpr::parse)
 
 /* vim:ts=2:sw=2:et:
  */

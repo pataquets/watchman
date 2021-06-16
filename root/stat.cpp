@@ -2,177 +2,245 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include "InMemoryView.h"
+#include "watchman_error_category.h"
 
-void stat_path(
-    struct write_locked_watchman_root* lock,
-    struct watchman_pending_collection* coll,
-    const w_string& full_path,
-    struct timeval now,
-    int flags,
-    struct watchman_dir_ent* pre_stat) {
-  struct watchman_stat st;
-  int res, err;
-  char path[WATCHMAN_NAME_MAX];
-  bool recursive = flags & W_PENDING_RECURSIVE;
-  bool via_notify = flags & W_PENDING_VIA_NOTIFY;
-  w_root_t *root = lock->root;
+namespace watchman {
 
-  if (w_ht_get(root->ignore.ignore_dirs, w_ht_ptr_val(full_path))) {
-    w_log(
-        W_LOG_DBG,
-        "%.*s matches ignore_dir rules\n",
-        int(full_path.size()),
-        full_path.data());
+/**
+ * The purpose of this function is to help us decide whether we should
+ * update the parent directory when a non-directory directory entry is changed.
+ * If so, we schedule re-examining the parent. Not all systems report the
+ * containing directory as changed in that situation, so we decide this based on
+ * the capabilities of the watcher. If the directory is added to the
+ * PendingCollection, this function returns true. Otherwise, this function
+ * returns false.
+ */
+bool InMemoryView::propagateToParentDirIfAppropriate(
+    const watchman_root& root,
+    PendingChanges& coll,
+    std::chrono::system_clock::time_point now,
+    const FileInformation& entryStat,
+    const w_string& dirName,
+    const watchman_dir* parentDir,
+    bool isUnlink) {
+  if ((watcher_->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) &&
+      dirName != root.root_path && !entryStat.isDir() &&
+      parentDir->last_check_existed) {
+    /* We're deliberately not propagating any of the flags through
+     * from statPath() (which calls us); we
+     * definitely don't want this to be a recursive evaluation.
+     * Previously, we took pains to avoid turning on VIA_NOTIFY
+     * here to avoid spuriously marking the node as changed when
+     * only its atime was changed to avoid tickling some behavior
+     * in the Pants build system:
+     * https://github.com/facebook/watchman/issues/305 and
+     * https://github.com/facebook/watchman/issues/307, but
+     * unfortunately we do need to set it here because eg:
+     * Linux doesn't send an inotify event for the parent
+     * directory for an unlink, and if we rely on stat()
+     * alone, the filesystem mtime granularity may be too
+     * low for us to detect that the parent has changed.
+     * As a compromize, if we're told that the change was due
+     * to an unlink, then we force delivery of a change event,
+     * otherwise we'll only do so if the directory has
+     * observably changed via stat().
+     */
+    coll.add(dirName, now, isUnlink ? W_PENDING_VIA_NOTIFY : 0);
+    return true;
+  }
+  return false;
+}
+
+void InMemoryView::statPath(
+    watchman_root& root,
+    ViewDatabase& view,
+    PendingChanges& coll,
+    const PendingChange& pending,
+    const watchman_dir_ent* pre_stat) {
+  bool recursive = pending.flags & W_PENDING_RECURSIVE;
+  bool via_notify = pending.flags & W_PENDING_VIA_NOTIFY;
+  int desynced_flag = pending.flags & W_PENDING_IS_DESYNCED;
+
+  if (root.ignore.isIgnoreDir(pending.path)) {
+    logf(DBG, "{} matches ignore_dir rules\n", pending.path);
     return;
   }
 
-  if (full_path.size() > sizeof(path) - 1) {
-    w_log(
-        W_LOG_FATAL,
-        "path %.*s is too big\n",
-        int(full_path.size()),
-        full_path.data());
+  char path[WATCHMAN_NAME_MAX];
+  if (pending.path.size() > sizeof(path) - 1) {
+    logf(FATAL, "path {} is too big\n", pending.path);
   }
 
-  memcpy(path, full_path.data(), full_path.size());
-  path[full_path.size()] = 0;
+  memcpy(path, pending.path.data(), pending.path.size());
+  path[pending.path.size()] = 0;
 
-  auto dir_name = full_path.dirName();
-  auto file_name = full_path.baseName();
-  auto dir = w_root_resolve_dir(lock, dir_name, true);
+  auto dir_name = pending.path.dirName();
+  auto file_name = pending.path.baseName();
+  auto parentDir = view.resolveDir(dir_name, true);
 
-  auto file = dir->getChildFile(file_name);
+  auto file = parentDir->getChildFile(file_name);
 
-  auto dir_ent = dir->getChildDir(file_name);
+  auto dir_ent = parentDir->getChildDir(file_name);
 
+  watchman::FileInformation st;
+  std::error_code errcode;
   if (pre_stat && pre_stat->has_stat) {
-    memcpy(&st, &pre_stat->stat, sizeof(st));
-    res = 0;
-    err = 0;
+    st = pre_stat->stat;
   } else {
-    struct stat struct_stat;
-    res = w_lstat(path, &struct_stat, root->case_sensitive);
-    err = res == 0 ? 0 : errno;
-    w_log(W_LOG_DBG, "w_lstat(%s) file=%p dir=%p res=%d %s\n",
-        path, file, dir_ent, res, strerror(err));
-    if (err == 0) {
-      struct_stat_to_watchman_stat(&struct_stat, &st);
-    } else {
-      // To suppress warning on win32
-      memset(&st, 0, sizeof(st));
+    try {
+      st = getFileInformation(path, root.case_sensitive);
+      log(DBG,
+          "getFileInformation(",
+          path,
+          ") file=",
+          fmt::ptr(file),
+          " dir=",
+          fmt::ptr(dir_ent),
+          "\n");
+    } catch (const std::system_error& exc) {
+      errcode = exc.code();
+      log(DBG,
+          "getFileInformation(",
+          path,
+          ") file=",
+          fmt::ptr(file),
+          " dir=",
+          fmt::ptr(dir_ent),
+          " failed: ",
+          exc.what(),
+          "\n");
     }
   }
 
-  if (res && (err == ENOENT || err == ENOTDIR)) {
+  if (processedPaths_) {
+    processedPaths_->write(PendingChangeLogEntry{pending, errcode, st});
+  }
+
+  if (errcode == watchman::error_code::no_such_file_or_directory ||
+      errcode == watchman::error_code::not_a_directory) {
     /* it's not there, update our state */
     if (dir_ent) {
-      w_root_mark_deleted(lock, dir_ent, now, true);
-      w_log(
-          W_LOG_DBG,
-          "w_lstat(%s) -> %s so stopping watch on %.*s\n",
+      view.markDirDeleted(*watcher_, dir_ent, getClock(pending.now), true);
+      watchman::log(
+          watchman::DBG,
+          "getFileInformation(",
           path,
-          strerror(err),
-          int(dir_name.size()),
-          dir_name.data());
-      stop_watching_dir(lock, dir_ent);
+          ") -> ",
+          errcode.message(),
+          " so stopping watch\n");
     }
     if (file) {
       if (file->exists) {
-        w_log(W_LOG_DBG, "w_lstat(%s) -> %s so marking %.*s deleted\n", path,
-              strerror(err), w_file_get_name(file)->len,
-              w_file_get_name(file)->buf);
+        watchman::log(
+            watchman::DBG,
+            "getFileInformation(",
+            path,
+            ") -> ",
+            errcode.message(),
+            " so marking ",
+            file->getName(),
+            " deleted\n");
         file->exists = false;
-        w_root_mark_file_changed(lock, file, now);
+        view.markFileChanged(*watcher_, file, getClock(pending.now));
       }
     } else {
       // It was created and removed before we could ever observe it
       // in the filesystem.  We need to generate a deleted file
       // representation of it now, so that subscription clients can
       // be notified of this event
-      file = w_root_resolve_file(lock, dir, file_name, now);
-      w_log(W_LOG_DBG, "w_lstat(%s) -> %s and file node was NULL. "
-          "Generating a deleted node.\n", path, strerror(err));
+      file = view.getOrCreateChildFile(
+          *watcher_, parentDir, file_name, getClock(pending.now));
+      log(DBG,
+          "getFileInformation(",
+          path,
+          ") -> ",
+          errcode.message(),
+          " and file node was NULL. "
+          "Generating a deleted node.\n");
       file->exists = false;
-      w_root_mark_file_changed(lock, file, now);
+      view.markFileChanged(*watcher_, file, getClock(pending.now));
     }
 
-    if (!root->case_sensitive && !w_string_equal(dir_name, root->root_path) &&
-        dir->last_check_existed) {
+    if (!propagateToParentDirIfAppropriate(
+            root,
+            coll,
+            pending.now,
+            file->stat,
+            dir_name,
+            parentDir,
+            /* isUnlink= */ true) &&
+        root.case_sensitive == CaseSensitivity::CaseInSensitive &&
+        !w_string_equal(dir_name, root.root_path) &&
+        parentDir->last_check_existed) {
       /* If we rejected the name because it wasn't canonical,
        * we need to ensure that we look in the parent dir to discover
        * the new item(s) */
-      w_log(
-          W_LOG_DBG,
-          "we're case insensitive, and %s is ENOENT, "
-          "speculatively look at parent dir %.*s\n",
+      logf(
+          DBG,
+          "we're case insensitive, and {} is ENOENT, "
+          "speculatively look at parent dir {}\n",
           path,
-          int(dir_name.size()),
-          dir_name.data());
-      w_pending_coll_add(coll, dir_name, now, W_PENDING_CRAWL_ONLY);
+          dir_name);
+      coll.add(dir_name, pending.now, W_PENDING_CRAWL_ONLY);
     }
 
-  } else if (res) {
-    w_log(W_LOG_ERR, "w_lstat(%s) %d %s\n",
-        path, err, strerror(err));
+  } else if (errcode.value()) {
+    log(ERR,
+        "getFileInformation(",
+        path,
+        ") failed and not handled! -> ",
+        errcode.message(),
+        " value=",
+        errcode.value(),
+        " category=",
+        errcode.category().name(),
+        "\n");
   } else {
     if (!file) {
-      file = w_root_resolve_file(lock, dir, file_name, now);
+      file = view.getOrCreateChildFile(
+          *watcher_, parentDir, file_name, getClock(pending.now));
     }
 
     if (!file->exists) {
       /* we're transitioning from deleted to existing,
        * so we're effectively new again */
-      file->ctime.ticks = root->inner.ticks;
-      file->ctime.timestamp = now.tv_sec;
+      file->ctime.ticks = mostRecentTick_;
+      file->ctime.timestamp = std::chrono::system_clock::to_time_t(pending.now);
       /* if a dir was deleted and now exists again, we want
        * to crawl it again */
       recursive = true;
     }
     if (!file->exists || via_notify || did_file_change(&file->stat, &st)) {
-      w_log(W_LOG_DBG,
-          "file changed exists=%d via_notify=%d stat-changed=%d isdir=%d %s\n",
-          (int)file->exists,
-          (int)via_notify,
-          (int)(file->exists && !via_notify),
-          S_ISDIR(st.mode),
-          path
-      );
+      logf(
+          DBG,
+          "file changed exists={} via_notify={} stat-changed={} isdir={} {}\n",
+          file->exists,
+          via_notify,
+          file->exists && !via_notify,
+          st.isDir(),
+          path);
       file->exists = true;
-      w_root_mark_file_changed(lock, file, now);
+      view.markFileChanged(*watcher_, file, getClock(pending.now));
+
+      // If the inode number changed then we definitely need to recursively
+      // examine any children because we cannot assume that the kernel will
+      // have given us the correct hints about this change.  BTRFS is one
+      // example of a filesystem where this has been observed to happen.
+      if (file->stat.ino != st.ino) {
+        recursive = true;
+      }
     }
 
     memcpy(&file->stat, &st, sizeof(file->stat));
 
-#ifndef _WIN32
     // check for symbolic link
-    if (S_ISLNK(st.mode)) {
-      char link_target_path[WATCHMAN_NAME_MAX];
-      ssize_t tlen = 0;
-
-      tlen = readlink(path, link_target_path, sizeof(link_target_path));
-      if (tlen < 0 || tlen >= WATCHMAN_NAME_MAX) {
-        w_log(W_LOG_ERR,
-            "readlink(%s) errno=%d tlen=%d\n", path, errno, (int)tlen);
-        file->symlink_target.reset();
-      } else {
-        bool symlink_changed = false;
-        w_string new_symlink_target(link_target_path, tlen, W_STRING_BYTE);
-        if (file->symlink_target != new_symlink_target) {
-          symlink_changed = true;
-        }
-        file->symlink_target = new_symlink_target;
-
-        if (symlink_changed && cfg_get_bool(root, "watch_symlinks", false)) {
-          w_pending_coll_add(
-              &root->inner.pending_symlink_targets, full_path, now, 0);
-        }
-      }
-    } else {
-      file->symlink_target.reset();
+    if (st.isSymlink() && root.config.getBool("watch_symlinks", false)) {
+      root.inner.pending_symlink_targets.lock()->add(
+          pending.path, pending.now, 0);
     }
-#endif
 
-    if (S_ISDIR(st.mode)) {
+    if (st.isDir()) {
       if (dir_ent == NULL) {
         recursive = true;
       } else {
@@ -181,48 +249,56 @@ void stat_path(
       }
 
       // Don't recurse if our parent is an ignore dir
-      if (!w_ht_get(root->ignore.ignore_vcs, w_ht_ptr_val(dir_name)) ||
+      if (!root.ignore.isIgnoreVCS(dir_name) ||
           // but do if we're looking at the cookie dir (stat_path is never
           // called for the root itself)
-          w_string_equal(full_path, root->query_cookie_dir)) {
-
-        if (!root->watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
-          /* we always need to crawl, but may not need to be fully recursive */
-          w_pending_coll_add(coll, full_path, now,
-              W_PENDING_CRAWL_ONLY | (recursive ? W_PENDING_RECURSIVE : 0));
+          root.cookies.isCookieDir(pending.path)) {
+        if (recursive) {
+          /* we always need to crawl if we're recursive, this can happen when a
+           * directory is created */
+          coll.add(
+              pending.path,
+              pending.now,
+              desynced_flag | W_PENDING_RECURSIVE | W_PENDING_CRAWL_ONLY);
         } else {
-          /* we get told about changes on the child, so we only
-           * need to crawl if we've never seen the dir before.
-           * An exception is that fsevents will only report the root
-           * of a dir rename and not a rename event for all of its
-           * children. */
-          if (recursive) {
-            w_pending_coll_add(coll, full_path, now,
-                W_PENDING_RECURSIVE|W_PENDING_CRAWL_ONLY);
+          if (watcher_->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
+            /* we get told about changes on the child, so we don't need to do
+             * anything */
+          } else if (watcher_->flags & WATCHER_ONLY_DIRECTORY_NOTIFICATIONS) {
+            /* on file changes, we receive a notification on the directory and
+             * thus we just need to crawl this one directory to consider all
+             * the pending files. To avoid recursing into the path recursively,
+             * the flags are passed as is and the crawler will only recurse
+             * down if W_PENDING_VIA_NOTIFY is set. */
+            coll.add(
+                pending.path,
+                pending.now,
+                pending.flags | W_PENDING_CRAWL_ONLY);
+          } else {
+            /* in all the other cases, crawl */
+            coll.add(
+                pending.path,
+                pending.now,
+                desynced_flag | W_PENDING_CRAWL_ONLY);
           }
         }
       }
     } else if (dir_ent) {
       // We transitioned from dir to file (see fishy.php), so we should prune
       // our former tree here
-      w_root_mark_deleted(lock, dir_ent, now, true);
+      view.markDirDeleted(*watcher_, dir_ent, getClock(pending.now), true);
     }
-    if ((root->watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) &&
-        !S_ISDIR(st.mode) && !w_string_equal(dir_name, root->root_path) &&
-        dir->last_check_existed) {
-      /* Make sure we update the mtime on the parent directory.
-       * We're deliberately not propagating any of the flags through; we
-       * definitely don't want this to be a recursive evaluation and we
-       * won'd want to treat this as VIA_NOTIFY to avoid spuriously
-       * marking the node as changed when only its atime was changed.
-       * https://github.com/facebook/watchman/issues/305 and
-       * https://github.com/facebook/watchman/issues/307 have more
-       * context on why this is.
-       */
-      w_pending_coll_add(coll, dir_name, now, 0);
-    }
+    propagateToParentDirIfAppropriate(
+        root,
+        coll,
+        pending.now,
+        st,
+        dir_name,
+        parentDir,
+        /* isUnlink= */ false);
   }
 }
+} // namespace watchman
 
 /* vim:ts=2:sw=2:et:
  */

@@ -2,6 +2,42 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include "InMemoryView.h"
+#include "watchman_error_category.h"
+
+using folly::to;
+using watchman::w_perf_t;
+
+void watchman_root::syncToNow(std::chrono::milliseconds timeout) {
+  w_perf_t sample("sync_to_now");
+  auto root = shared_from_this();
+  try {
+    view()->syncToNow(root, timeout);
+    if (sample.finish()) {
+      sample.add_root_meta(root);
+      sample.add_meta(
+          "sync_to_now",
+          json_object(
+              {{"success", json_boolean(true)},
+               {"timeoutms", json_integer(timeout.count())}}));
+      sample.log();
+    }
+  } catch (const std::exception& exc) {
+    sample.force_log();
+    sample.finish();
+    sample.add_root_meta(root);
+    sample.add_meta(
+        "sync_to_now",
+        json_object(
+            {{"success", json_boolean(false)},
+             {"reason", w_string_to_json(exc.what())},
+             {"timeoutms", json_integer(timeout.count())}}));
+    sample.log();
+    throw;
+  }
+}
+
+namespace watchman {
 
 /* Ensure that we're synchronized with the state of the
  * filesystem at the current time.
@@ -9,128 +45,108 @@
  * observe it via inotify.  When we see it we know that
  * we've seen everything up to the point in time at which
  * we're asking questions.
- * Returns true if we observe the change within the requested
- * time, false otherwise.
- * Must be called with the root UNLOCKED.  This function
- * will acquire and release the root lock.
- */
-bool w_root_sync_to_now(struct unlocked_watchman_root *unlocked,
-                        int timeoutms) {
-  uint32_t tick;
-  struct watchman_query_cookie cookie;
-  w_stm_t file;
-  int errcode = 0;
-  struct timespec deadline;
-  struct write_locked_watchman_root lock;
+ * Throws a std::system_error with an ETIMEDOUT error if
+ * the timeout expires before we observe the change, or
+ * a runtime_error if the root has been deleted or rendered
+ * inaccessible. */
+void InMemoryView::syncToNow(
+    const std::shared_ptr<watchman_root>& root,
+    std::chrono::milliseconds timeout) {
+  syncToNowCookies(root, timeout);
 
-  w_perf_t sample("sync_to_now");
-
-  if (pthread_cond_init(&cookie.cond, NULL)) {
-    errcode = errno;
-    w_log(W_LOG_ERR, "sync_to_now: cond_init failed: %s\n", strerror(errcode));
-    errno = errcode;
-    return false;
+  // Some watcher implementations (notably, FSEvents) reorder change events
+  // before they're reported, and cookie files are not sufficient. Instead, the
+  // watcher supports direct synchronization. Once a cookie file has been
+  // observed, ensure that all pending events have been flushed and wait until
+  // the pending event queue is fully crawled.
+  auto result = watcher_->flushPendingEvents();
+  if (result.valid()) {
+    // The watcher has made all pending events available and inserted a promise
+    // into its PendingCollection. Wait for InMemoryView to observe it and
+    // everything prior.
+    //
+    // Would be nice to use a deadline rather than a timeout here.
+    std::move(result).get(timeout);
   }
-
-  if (pthread_mutex_init(&cookie.lock, NULL)) {
-    errcode = errno;
-    pthread_cond_destroy(&cookie.cond);
-    w_log(W_LOG_ERR, "sync_to_now: mutex_init failed: %s\n", strerror(errcode));
-    errno = errcode;
-    return false;
-  }
-  cookie.seen = false;
-  pthread_mutex_lock(&cookie.lock);
-
-  /* generate a cookie name: cookie prefix + id */
-  w_root_lock(unlocked, "w_root_sync_to_now", &lock);
-  tick = lock.root->inner.ticks++;
-  auto path_str = w_string::printf(
-      "%.*s%" PRIu32 "-%" PRIu32,
-      lock.root->query_cookie_prefix.size(),
-      lock.root->query_cookie_prefix.data(),
-      lock.root->inner.number,
-      tick);
-  /* insert our cookie in the map */
-  lock.root->query_cookies[path_str] = &cookie;
-  w_root_unlock(&lock, unlocked);
-
-  /* touch the file */
-  file = w_stm_open(
-      path_str.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0700);
-  if (!file) {
-    errcode = errno;
-    w_log(
-        W_LOG_ERR,
-        "sync_to_now: creat(%s) failed: %s\n",
-        path_str.c_str(),
-        strerror(errcode));
-    goto out;
-  }
-  w_stm_close(file);
-
-  /* compute deadline */
-  w_timeoutms_to_abs_timespec(timeoutms, &deadline);
-
-  w_log(W_LOG_DBG, "sync_to_now [%s] waiting\n", path_str.c_str());
-
-  /* timed cond wait (unlocks root lock, reacquires) */
-  while (!cookie.seen) {
-    errcode = pthread_cond_timedwait(&cookie.cond, &cookie.lock, &deadline);
-    if (errcode && !cookie.seen) {
-      w_log(
-          W_LOG_ERR,
-          "sync_to_now: %s timedwait failed: %d: istimeout=%d %s\n",
-          path_str.c_str(),
-          errcode,
-          errcode == ETIMEDOUT,
-          strerror(errcode));
-      goto out;
-    }
-  }
-  w_log(W_LOG_DBG, "sync_to_now [%s] done\n", path_str.c_str());
-
-out:
-  pthread_mutex_unlock(&cookie.lock);
-  w_root_lock(unlocked, "w_root_sync_to_now_done", &lock);
-
-  // can't unlink the file until after the cookie has been observed because
-  // we don't know which file got changed until we look in the cookie dir
-  unlink(path_str.c_str());
-  lock.root->query_cookies.erase(path_str);
-  w_root_unlock(&lock, unlocked);
-
-  // We want to know about all timeouts
-  if (!cookie.seen) {
-    sample.force_log();
-  }
-
-  if (sample.finish()) {
-    sample.add_root_meta(unlocked->root);
-    sample.add_meta(
-        "sync_to_now",
-        json_pack(
-            "{s:b, s:i, s:i}",
-            "success",
-            cookie.seen,
-            "timeoutms",
-            timeoutms,
-            "errcode",
-            errcode));
-    sample.log();
-  }
-
-  pthread_cond_destroy(&cookie.cond);
-  pthread_mutex_destroy(&cookie.lock);
-
-  if (!cookie.seen) {
-    errno = errcode;
-    return false;
-  }
-
-  return true;
 }
 
+void InMemoryView::syncToNowCookies(
+    const std::shared_ptr<watchman_root>& root,
+    std::chrono::milliseconds timeout) {
+  try {
+    cookies_.syncToNow(timeout);
+  } catch (const std::system_error& exc) {
+    auto cookieDirs = cookies_.cookieDirs();
+
+    if (exc.code() == watchman::error_code::no_such_file_or_directory ||
+        exc.code() == watchman::error_code::permission_denied ||
+        exc.code() == watchman::error_code::not_a_directory) {
+      // A key path was removed; this is either the vcs dir (.hg, .git, .svn)
+      // or possibly the root of the watch itself.
+      if (!(watcher_->flags & WATCHER_HAS_SPLIT_WATCH)) {
+        w_assert(
+            cookieDirs.size() == 1,
+            "Non split watchers cannot have multiple cookie directories");
+        if (cookieDirs.count(rootPath_) == 1) {
+          // If the root was removed then we need to cancel the watch.
+          // We may have already observed the removal via the notifythread,
+          // but in some cases (eg: btrfs subvolume deletion) no notification
+          // is received.
+          root->cancel();
+          throw std::runtime_error("root dir was removed or is inaccessible");
+        } else {
+          // The cookie dir was a VCS subdir and it got deleted.  Let's
+          // focus instead on the parent dir and recursively retry.
+          cookies_.setCookieDir(rootPath_);
+          return cookies_.syncToNow(timeout);
+        }
+      } else {
+        // Split watchers have one watch on the root and watches for nested
+        // directories, and syncToNow will only throw if no cookies were
+        // created, ie: if all the nested watched directories are no longer
+        // present and the root directory has been removed.
+        root->cancel();
+        throw std::runtime_error("root dir was removed or is inaccessible");
+      }
+    }
+
+    // Let's augment the error reason with the current recrawl state,
+    // if any.
+    {
+      auto info = root->recrawlInfo.rlock();
+
+      if (!root->inner.done_initial || info->shouldRecrawl) {
+        std::string extra = (info->recrawlCount > 0)
+            ? to<std::string>("(re-crawling, count=", info->recrawlCount, ")")
+            : "(performing initial crawl)";
+
+        throw std::system_error(
+            exc.code(), to<std::string>(exc.what(), ". ", extra));
+      }
+    }
+
+    // On BTRFS we're not guaranteed to get notified about all classes
+    // of replacement so we make a best effort attempt to do something
+    // reasonable.   Let's pretend that we got notified about the cookie
+    // dir changing and schedule the IO thread to look at it.
+    // If it observes a change it will do the right thing.
+    {
+      auto now = std::chrono::system_clock::now();
+
+      auto lock = pending_.lock();
+      for (const auto& dir : cookieDirs) {
+        lock->add(dir, now, W_PENDING_CRAWL_ONLY);
+      }
+      lock->ping();
+    }
+
+    // We didn't have any useful additional contextual information
+    // to add so let's just bubble up the exception.
+    throw;
+  }
+}
+
+} // namespace watchman
 
 /* vim:ts=2:sw=2:et:
  */

@@ -1,14 +1,102 @@
 /* Copyright 2016-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 
+#include "watchman_system.h"
 #include "watchman.h"
+#include <folly/Synchronized.h>
+#include <condition_variable>
+#include <thread>
+#include "ChildProcess.h"
+#include "Logging.h"
 #include "watchman_perf.h"
 
-static pthread_t perf_log_thr;
-static pthread_mutex_t perf_log_lock = PTHREAD_MUTEX_INITIALIZER;
-static json_t *perf_log_samples = NULL;
-static pthread_cond_t perf_log_cond;
-static bool perf_log_thread_started = false;
+namespace watchman {
+namespace {
+class PerfLogThread {
+  struct State {
+    explicit State(bool start) : running(start) {}
+
+    bool running;
+    json_ref samples;
+  };
+
+  folly::Synchronized<State, std::mutex> state_;
+  std::thread thread_;
+  std::condition_variable cond_;
+
+  void loop() noexcept;
+
+ public:
+  explicit PerfLogThread(bool start) : state_(folly::in_place, start) {
+    if (start) {
+      thread_ = std::thread([this] { loop(); });
+    }
+  }
+
+  ~PerfLogThread() {
+    stop();
+  }
+
+  void stop() {
+    {
+      auto state = state_.lock();
+      if (!state->running) {
+        return;
+      }
+      state->running = false;
+    }
+    cond_.notify_all();
+    thread_.join();
+  }
+
+  void addSample(json_ref&& sample) {
+    auto wlock = state_.lock();
+    if (!wlock->samples) {
+      wlock->samples = json_array();
+    }
+    json_array_append_new(wlock->samples, std::move(sample));
+    cond_.notify_one();
+  }
+};
+
+PerfLogThread& getPerfThread(bool start = true) {
+  // Get the perf logging thread, starting it on the first call.
+  // Meyer's singleton!
+  static PerfLogThread perfThread(start);
+  return perfThread;
+}
+} // namespace
+
+void processSamples(
+    size_t argv_limit,
+    size_t maximum_batch_size,
+    json_ref samples,
+    std::function<void(std::vector<std::string>)> command_line,
+    std::function<void(std::string)> single_large_sample) {
+  while (json_array_size(samples) > 0) {
+    std::string encoded_sample = json_dumps(json_array_get(samples, 0), 0);
+    json_array_remove(samples, 0);
+
+    if (encoded_sample.size() > argv_limit) {
+      single_large_sample(std::move(encoded_sample));
+    } else {
+      std::vector<std::string> args;
+      args.push_back(std::move(encoded_sample));
+      size_t arg_size = encoded_sample.size() + 1;
+
+      while (args.size() < maximum_batch_size && json_array_size(samples) > 0) {
+        encoded_sample = json_dumps(json_array_get(samples, 0), 0);
+        if (arg_size + encoded_sample.size() + 1 > argv_limit) {
+          break;
+        }
+        json_array_remove(samples, 0);
+        arg_size += encoded_sample.size() + 1;
+        args.push_back(std::move(encoded_sample));
+      }
+      command_line(std::move(args));
+    }
+  }
+}
 
 watchman_perf_sample::watchman_perf_sample(const char* description)
     : description(description) {
@@ -16,13 +104,6 @@ watchman_perf_sample::watchman_perf_sample(const char* description)
 #ifdef HAVE_SYS_RESOURCE_H
   getrusage(RUSAGE_SELF, &usage_begin);
 #endif
-}
-
-watchman_perf_sample::~watchman_perf_sample() {
-  if (meta_data) {
-    json_decref(meta_data);
-  }
-  memset(this, 0, sizeof(*this));
 }
 
 bool watchman_perf_sample::finish() {
@@ -54,12 +135,13 @@ bool watchman_perf_sample::finish() {
 
   if (!will_log) {
     if (wall_time_elapsed_thresh == 0) {
-      json_t *thresh = cfg_get_json(NULL, "perf_sampling_thresh");
+      auto thresh = cfg_get_json("perf_sampling_thresh");
       if (thresh) {
-        if (json_is_number(thresh)) {
+        if (thresh.isNumber()) {
           wall_time_elapsed_thresh = json_number_value(thresh);
         } else {
-          json_unpack(thresh, "{s:f}", description, &wall_time_elapsed_thresh);
+          wall_time_elapsed_thresh = json_number_value(
+              thresh.get_default(description, json_real(0.0)));
         }
       }
     }
@@ -73,40 +155,29 @@ bool watchman_perf_sample::finish() {
   return will_log;
 }
 
-void watchman_perf_sample::add_meta(const char* key, json_t* val) {
-  if (!meta_data) {
-    meta_data = json_object();
-  }
-  set_prop(meta_data, key, val);
+void watchman_perf_sample::add_meta(const char* key, json_ref&& val) {
+  meta_data.set(key, std::move(val));
 }
 
-void watchman_perf_sample::add_root_meta(const w_root_t* root) {
+void watchman_perf_sample::add_root_meta(
+    const std::shared_ptr<watchman_root>& root) {
   // Note: if the root lock isn't held, we may read inaccurate numbers for
   // some of these properties.  We're ok with that, and don't want to force
   // the root lock to be re-acquired just for this.
+  auto meta = json_object(
+      {{"path", w_string_to_json(root->root_path)},
+       {"recrawl_count", json_integer(root->recrawlInfo.rlock()->recrawlCount)},
+       {"case_sensitive",
+        json_boolean(root->case_sensitive == CaseSensitivity::CaseSensitive)}});
 
-  add_meta(
-      "root",
-      json_pack(
-          "{s:o, s:i, s:i, s:i, s:b, s:u}",
-          "path",
-          w_string_to_json(root->root_path),
-          "recrawl_count",
-          root->recrawl_count,
-          "number",
-          root->inner.number,
-          "ticks",
-          root->inner.ticks,
-          "case_sensitive",
-          root->case_sensitive,
-          // there is potential to race with a concurrent w_root_init in some
-          // recrawl scenarios in the test harness.  In those cases it is
-          // possible that root->watcher_ops is briefly set to a NULL pointer.
-          // Since the target of that pointer is always a structure with a
-          // stable address, we can safely deal with reading a stale value, but
-          // we do need to guard against a NULL pointer value.
-          "watcher",
-          root->watcher_ops ? root->watcher_ops->name : "<recrawling>"));
+  // During recrawl, the view may be re-assigned.  Protect against
+  // reading a nullptr.
+  auto view = root->view();
+  if (view) {
+    meta.set({{"watcher", w_string_to_json(view->getName())}});
+  }
+
+  add_meta("root", std::move(meta));
 }
 
 void watchman_perf_sample::set_wall_time_thresh(double thresh) {
@@ -117,188 +188,174 @@ void watchman_perf_sample::force_log() {
   will_log = true;
 }
 
-static void *perf_log_thread(void *unused) {
-  json_t *samples = NULL;
-  char **envp;
-  json_t *perf_cmd;
+void PerfLogThread::loop() noexcept {
+  json_ref samples;
+  json_ref perf_cmd;
   int64_t sample_batch;
-
-  unused_parameter(unused);
 
   w_set_thread_name("perflog");
 
-  // Prep some things that we'll need each time we run a command
-  {
-    uint32_t env_size;
-    w_ht_t *envpht = w_envp_make_ht();
-    char *statedir = dirname(strdup(watchman_state_file));
-    w_envp_set_cstring(envpht, "WATCHMAN_STATE_DIR", statedir);
-    w_envp_set_cstring(envpht, "WATCHMAN_SOCK", get_sock_name());
-    envp = w_envp_make_from_ht(envpht, &env_size);
-    w_ht_free(envpht);
-  }
+  auto stateDir = w_string_piece(watchman_state_file).dirName().asWString();
 
-  perf_cmd = cfg_get_json(NULL, "perf_logger_command");
-  if (json_is_string(perf_cmd)) {
-    perf_cmd = json_pack("[O]", perf_cmd);
+  perf_cmd = cfg_get_json("perf_logger_command");
+  if (perf_cmd.isString()) {
+    perf_cmd = json_array({perf_cmd});
   }
-  if (!json_is_array(perf_cmd)) {
-    w_log(
-        W_LOG_FATAL,
+  if (!perf_cmd.isArray()) {
+    logf(
+        FATAL,
         "perf_logger_command must be either a string or an array of strings\n");
   }
 
-  sample_batch =
-      cfg_get_int(NULL, "perf_logger_command_max_samples_per_call", 4);
+  sample_batch = cfg_get_int("perf_logger_command_max_samples_per_call", 4);
 
   while (true) {
-    pthread_mutex_lock(&perf_log_lock);
-    if (!perf_log_samples) {
-      pthread_cond_wait(&perf_log_cond, &perf_log_lock);
-    }
-    samples = perf_log_samples;
-    perf_log_samples = NULL;
+    {
+      auto state = state_.lock();
+      while (true) {
+        if (state->samples) {
+          // We found samples to process
+          break;
+        }
+        if (!state->running) {
+          // No samples remaining, and we have been asked to quit.
+          return;
+        }
+        cond_.wait(state.as_lock());
+      }
 
-    pthread_mutex_unlock(&perf_log_lock);
+      samples = nullptr;
+      std::swap(samples, state->samples);
+    }
 
     if (samples) {
-      while (json_array_size(samples) > 0) {
-        int i = 0;
-        json_t *cmd = json_array();
-        posix_spawnattr_t attr;
-        posix_spawn_file_actions_t actions;
-        pid_t pid;
-        char **argv = NULL;
+      // Hack: Divide by two because this limit includes environment variables
+      // and perf_cmd.
+      // It's possible to compute this correctly on every platform given the
+      // current environment and any specified environment variables, but it's
+      // fine to be conservative here.
+      const size_t argv_limit = ChildProcess::getArgMax() / 2;
 
-        json_array_extend(cmd, perf_cmd);
+      processSamples(
+          argv_limit,
+          sample_batch,
+          samples,
+          [&](std::vector<std::string> sample_args) {
+            std::vector<w_string_piece> cmd;
+            cmd.reserve(perf_cmd.array().size() + sample_args.size());
 
-        while (i < sample_batch && json_array_size(samples) > 0) {
-          char *stringy = json_dumps(json_array_get(samples, 0), 0);
-          if (stringy) {
-            json_array_append_new(
-                cmd, typed_string_to_json(stringy, W_STRING_MIXED));
-            free(stringy);
-          }
-          json_array_remove(samples, 0);
-          i++;
-        }
+            for (auto& c : perf_cmd.array()) {
+              cmd.push_back(json_to_w_string(c));
+            }
+            for (auto& sample : sample_args) {
+              cmd.push_back(sample);
+            }
 
-        argv = w_argv_copy_from_json(cmd, 0);
-        if (!argv) {
-          char *dumped = json_dumps(cmd, 0);
-          w_log(W_LOG_FATAL, "error converting %s to an argv array\n", dumped);
-        }
+            ChildProcess::Options opts;
+            opts.environment().set(
+                {{"WATCHMAN_STATE_DIR", stateDir},
+                 {"WATCHMAN_SOCK", get_sock_name_legacy()}});
+            opts.open(STDIN_FILENO, "/dev/null", O_RDONLY, 0666);
+            opts.open(STDOUT_FILENO, "/dev/null", O_WRONLY, 0666);
+            opts.open(STDERR_FILENO, "/dev/null", O_WRONLY, 0666);
 
-        posix_spawnattr_init(&attr);
-#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
-        posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
-#endif
-        posix_spawn_file_actions_init(&actions);
-        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null",
-                                         O_RDONLY, 0666);
-        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null",
-                                         O_WRONLY, 0666);
-        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null",
-                                         O_WRONLY, 0666);
+            try {
+              ChildProcess proc(cmd, std::move(opts));
+              proc.wait();
+            } catch (const std::exception& exc) {
+              watchman::log(
+                  watchman::ERR,
+                  "failed to spawn perf logger: ",
+                  exc.what(),
+                  "\n");
+            }
+          },
+          [&](std::string sample_stdin) {
+            ChildProcess::Options opts;
+            opts.environment().set(
+                {{"WATCHMAN_STATE_DIR", stateDir},
+                 {"WATCHMAN_SOCK", get_sock_name_legacy()}});
+            opts.pipeStdin();
+            opts.open(STDOUT_FILENO, "/dev/null", O_WRONLY, 0666);
+            opts.open(STDERR_FILENO, "/dev/null", O_WRONLY, 0666);
 
-        if (posix_spawnp(&pid, argv[0], &actions, &attr, argv, envp) == 0) {
-          // There's no sense waiting here, because w_reap_children is called
-          // by the reaper thread.
-        } else {
-          int err = errno;
-          w_log(W_LOG_ERR, "failed to spawn %s: %s\n", argv[0],
-                strerror(err));
-        }
+            try {
+              ChildProcess proc({perf_cmd}, std::move(opts));
 
-        posix_spawnattr_destroy(&attr);
-        posix_spawn_file_actions_destroy(&actions);
+              auto stdinPipe = proc.takeStdin();
 
-        free(argv);
-        json_decref(cmd);
-      }
-      json_decref(samples);
+              const char* data = sample_stdin.data();
+              size_t size = sample_stdin.size();
+
+              size_t total_written = 0;
+              while (total_written < sample_stdin.size()) {
+                auto result = stdinPipe->write.write(data, size);
+                result.throwIfError();
+                auto written = result.value();
+                data += written;
+                size -= written;
+                total_written += written;
+              }
+
+              // close stdin to allow the process to terminate
+              stdinPipe.reset();
+              proc.wait();
+            } catch (const std::exception& exc) {
+              watchman::log(
+                  watchman::ERR,
+                  "failed to spawn perf logger: ",
+                  exc.what(),
+                  "\n");
+            }
+          });
     }
   }
-
-  return NULL;
 }
 
 void watchman_perf_sample::log() {
-  json_t *info;
-  char *dumped = NULL;
-
   if (!will_log) {
     return;
   }
 
   // Assemble a perf blob
-  info = json_pack(
-      "{s:u, s:O, s:i, s:u}",
-      "description",
-      description,
-      "meta",
-      meta_data,
-      "pid",
-      getpid(),
-      "version",
-      PACKAGE_VERSION);
+  auto info = json_object(
+      {{"description", typed_string_to_json(description)},
+       {"meta", meta_data},
+       {"pid", json_integer(::getpid())},
+       {"version", typed_string_to_json(PACKAGE_VERSION, W_STRING_UNICODE)}});
 
 #ifdef WATCHMAN_BUILD_INFO
-  set_unicode_prop(info, "buildinfo", WATCHMAN_BUILD_INFO);
+  info.set(
+      "buildinfo", typed_string_to_json(WATCHMAN_BUILD_INFO, W_STRING_UNICODE));
 #endif
 
-#define ADDTV(name, tv)                                                        \
-  set_prop(info, name, json_real(w_timeval_abs_seconds(tv)))
+#define ADDTV(name, tv) info.set(name, json_real(w_timeval_abs_seconds(tv)))
   ADDTV("elapsed_time", duration);
   ADDTV("start_time", time_begin);
 #ifdef HAVE_SYS_RESOURCE_H
   ADDTV("user_time", usage.ru_utime);
   ADDTV("system_time", usage.ru_stime);
-#define ADDU(n) set_prop(info, #n, json_integer(usage.n))
-  ADDU(ru_maxrss);
-  ADDU(ru_ixrss);
-  ADDU(ru_idrss);
-  ADDU(ru_minflt);
-  ADDU(ru_majflt);
-  ADDU(ru_nswap);
-  ADDU(ru_inblock);
-  ADDU(ru_oublock);
-  ADDU(ru_msgsnd);
-  ADDU(ru_msgrcv);
-  ADDU(ru_nsignals);
-  ADDU(ru_nvcsw);
-  ADDU(ru_nivcsw);
 #endif // HAVE_SYS_RESOURCE_H
-#undef ADDU
 #undef ADDTV
 
   // Log to the log file
-  dumped = json_dumps(info, 0);
-  w_log(W_LOG_ERR, "PERF: %s\n", dumped);
-  free(dumped);
+  auto dumped = json_dumps(info, 0);
+  watchman::log(watchman::ERR, "PERF: ", dumped, "\n");
 
-  if (!cfg_get_json(NULL, "perf_logger_command")) {
-    json_decref(info);
+  if (!cfg_get_json("perf_logger_command")) {
     return;
   }
 
   // Send this to our logging thread for async processing
-
-  pthread_mutex_lock(&perf_log_lock);
-  if (!perf_log_thread_started) {
-    pthread_cond_init(&perf_log_cond, NULL);
-    pthread_create(&perf_log_thr, NULL, perf_log_thread, NULL);
-    perf_log_thread_started = true;
-  }
-
-  if (!perf_log_samples) {
-    perf_log_samples = json_array();
-  }
-  json_array_append_new(perf_log_samples, info);
-  pthread_mutex_unlock(&perf_log_lock);
-
-  pthread_cond_signal(&perf_log_cond);
+  auto& perfThread = getPerfThread();
+  perfThread.addSample(std::move(info));
 }
+
+void perf_shutdown() {
+  getPerfThread(false).stop();
+}
+
+} // namespace watchman
 
 /* vim:ts=2:sw=2:et:
  */

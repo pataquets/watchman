@@ -1,9 +1,10 @@
 ---
-id: expr.anyof
+pageid: expr.anyof
 title: anyof
 layout: docs
 section: Expression Terms
 permalink: docs/expr/anyof.html
+redirect_from: docs/expr/anyof/
 ---
 
 The `anyof` expression term evaluates as true if any of the grouped expressions

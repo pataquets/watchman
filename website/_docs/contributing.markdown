@@ -1,8 +1,9 @@
 ---
-id: contributing
+pageid: contributing
 title: Contributing
 layout: docs
 permalink: contributing.html
+redirect_from: contributing/
 section: Internals
 ---
 
@@ -19,6 +20,10 @@ If we ask you to fill out a CLA we'll direct you to [our online CLA
 page](https://code.facebook.com/cla) where you can complete it
 easily.  We use the same form as the Apache CLA so that friction is minimal.
 
+Facebook Open Source provides a Code of Conduct statement for all
+projects to follow, to promote a welcoming and safe open source community.
+Please [read the full text](https://code.facebook.com/codeofconduct) so that you can understand what actions will and will not be tolerated.
+
 ### Getting Started
 
 You need to be able to build watchman from source and run its test suite.
@@ -27,14 +32,19 @@ You will need:
 * python
 * automake
 * autoconf
+* cmake
+* libtool (or glibtool on macOS)
 * libpcre
+* libfolly (only needed if building the cppclient library)
 * nodejs (for fb-watchman)
+
+The build time dependencies can be installed by running `getdeps.py --install-deps`.
+This is run for you when you run `autogen.sh` in the example below:
 
 ```
 $ git clone https://github.com/facebook/watchman.git
 $ cd watchman
 $ ./autogen.sh
-$ ./configure
 $ make
 ```
 

@@ -1,28 +1,26 @@
 /* Copyright 2012-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 #pragma once
-
-struct watchman_stat {
-  struct timespec atime, mtime, ctime;
-  off_t size;
-  mode_t mode;
-  uid_t uid;
-  gid_t gid;
-  ino_t ino;
-  dev_t dev;
-  nlink_t nlink;
-};
-
-/* opaque (system dependent) type for walking dir contents */
-struct watchman_dir_handle;
+#include "FileInformation.h"
 
 struct watchman_dir_ent {
   bool has_stat;
-  char *d_name;
-  struct watchman_stat stat;
+  char* d_name;
+  watchman::FileInformation stat;
 };
 
-struct watchman_dir_handle *w_dir_open(const char *path);
-struct watchman_dir_ent *w_dir_read(struct watchman_dir_handle *dir);
-void w_dir_close(struct watchman_dir_handle *dir);
-int w_dir_fd(struct watchman_dir_handle *dir);
+class watchman_dir_handle {
+ public:
+  virtual ~watchman_dir_handle() = default;
+  virtual const watchman_dir_ent* readDir() = 0;
+#ifndef _WIN32
+  virtual int getFd() const = 0;
+#endif
+};
+
+// Return a dir handle on path.
+// Does not follow symlinks strict == true.
+// Throws std::system_error if the dir could not be opened.
+std::unique_ptr<watchman_dir_handle> w_dir_open(
+    const char* path,
+    bool strict = true);

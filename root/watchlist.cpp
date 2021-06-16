@@ -3,50 +3,29 @@
 
 #include "watchman.h"
 
-w_ht_t *watched_roots = NULL;
-volatile long live_roots = 0;
-pthread_mutex_t watch_list_lock = PTHREAD_MUTEX_INITIALIZER;
+#include <folly/Synchronized.h>
+#include <vector>
 
-static w_ht_val_t root_copy_val(w_ht_val_t val) {
-  auto root = (w_root_t *)w_ht_val_ptr(val);
+using namespace watchman;
 
-  w_root_addref(root);
+folly::Synchronized<
+    std::unordered_map<w_string, std::shared_ptr<watchman_root>>>
+    watched_roots;
+std::atomic<long> live_roots{0};
 
-  return val;
-}
-
-static void root_del_val(w_ht_val_t val) {
-  auto root = (w_root_t *)w_ht_val_ptr(val);
-
-  w_root_delref_raw(root);
-}
-
-static const struct watchman_hash_funcs root_funcs = {
-  w_ht_string_copy,
-  w_ht_string_del,
-  w_ht_string_equal,
-  w_ht_string_hash,
-  root_copy_val,
-  root_del_val
-};
-
-void watchman_watcher_init(void) {
-  watched_roots = w_ht_new(4, &root_funcs);
-}
-
-bool remove_root_from_watched(
-    w_root_t *root /* don't care about locked state */) {
-  bool removed = false;
-  pthread_mutex_lock(&watch_list_lock);
+bool watchman_root::removeFromWatched() {
+  auto map = watched_roots.wlock();
+  auto it = map->find(root_path);
+  if (it == map->end()) {
+    return false;
+  }
   // it's possible that the root has already been removed and replaced with
   // another, so make sure we're removing the right object
-  if (w_ht_val_ptr(w_ht_get(watched_roots, w_ht_ptr_val(root->root_path))) ==
-      root) {
-    w_ht_del(watched_roots, w_ht_ptr_val(root->root_path));
-    removed = true;
+  if (it->second.get() == this) {
+    map->erase(it);
+    return true;
   }
-  pthread_mutex_unlock(&watch_list_lock);
-  return removed;
+  return false;
 }
 
 // Given a filename, walk the current set of watches.
@@ -56,272 +35,392 @@ bool remove_root_from_watched(
 // Returns NULL if there were no matches.
 // If multiple watches have the same prefix, it is undefined which one will
 // match.
-char *w_find_enclosing_root(const char *filename, char **relpath) {
-  w_ht_iter_t i;
-  w_root_t *root = NULL;
-  w_string name(filename, W_STRING_BYTE);
-  char *prefix = NULL;
-
-  pthread_mutex_lock(&watch_list_lock);
-  if (w_ht_first(watched_roots, &i)) do {
-    auto root_name = (w_string_t *)w_ht_val_ptr(i.key);
-    if (w_string_startswith(name, root_name) &&
-        (name.size() == root_name->len /* exact match */ ||
-         is_slash(name.data()[root_name->len]) /* dir container matches */)) {
-      root = (w_root_t*)w_ht_val_ptr(i.value);
-      w_root_addref(root);
-      break;
+bool findEnclosingRoot(
+    const w_string& fileName,
+    w_string_piece& prefix,
+    w_string_piece& relativePath) {
+  std::shared_ptr<watchman_root> root;
+  auto name = fileName.piece();
+  {
+    auto map = watched_roots.rlock();
+    for (const auto& it : *map) {
+      auto root_name = it.first;
+      if (name.startsWith(root_name.piece()) &&
+          (name.size() == root_name.size() /* exact match */ ||
+           is_slash(name[root_name.size()] /* dir container matches */))) {
+        root = it.second;
+        prefix = root_name.piece();
+        if (name.size() == root_name.size()) {
+          relativePath = w_string_piece();
+        } else {
+          relativePath = name;
+          relativePath.advance(root_name.size() + 1);
+        }
+        return true;
+      }
     }
-  } while (w_ht_next(watched_roots, &i));
-  pthread_mutex_unlock(&watch_list_lock);
-
-  if (!root) {
-    goto out;
   }
-
-  // extract the path portions
-  prefix = (char*)malloc(root->root_path.size() + 1);
-  if (!prefix) {
-    goto out;
-  }
-  memcpy(prefix, filename, root->root_path.size());
-  prefix[root->root_path.size()] = '\0';
-
-  if (root->root_path.size() == name.size()) {
-    *relpath = NULL;
-  } else {
-    *relpath = strdup(filename + root->root_path.size() + 1);
-  }
-
-out:
-  if (root) {
-    w_root_delref_raw(root);
-  }
-
-  return prefix;
+  return false;
 }
 
-json_t *w_root_stop_watch_all(void) {
-  uint32_t roots_count, i;
-  w_root_t **roots;
-  w_ht_iter_t iter;
-  json_t *stopped;
+json_ref w_root_stop_watch_all() {
+  std::vector<watchman_root*> roots;
+  json_ref stopped = json_array();
 
-  pthread_mutex_lock(&watch_list_lock);
-  roots_count = w_ht_size(watched_roots);
-  roots = (w_root_t**)calloc(roots_count, sizeof(*roots));
+  // Funky looking loop because root->cancel() needs to acquire the
+  // watched_roots wlock and will invalidate any iterators we might
+  // otherwise have held.  Therefore we just loop until the map is
+  // empty.
+  while (true) {
+    std::shared_ptr<watchman_root> root;
 
-  i = 0;
-  if (w_ht_first(watched_roots, &iter)) do {
-    auto root = (w_root_t *)w_ht_val_ptr(iter.value);
-    w_root_addref(root);
-    roots[i++] = root;
-  } while (w_ht_next(watched_roots, &iter));
+    {
+      auto map = watched_roots.wlock();
+      if (map->empty()) {
+        break;
+      }
 
-  stopped = json_array();
-  for (i = 0; i < roots_count; i++) {
-    w_root_t *root = roots[i];
-    w_string_t *path = root->root_path;
-    if (w_ht_del(watched_roots, w_ht_ptr_val(path))) {
-      w_root_cancel(root);
-      json_array_append_new(stopped, w_string_to_json(path));
+      auto it = map->begin();
+      root = it->second;
     }
-    w_root_delref_raw(root);
+
+    root->cancel();
+    json_array_append_new(stopped, w_string_to_json(root->root_path));
   }
-  free(roots);
-  pthread_mutex_unlock(&watch_list_lock);
 
   w_state_save();
 
   return stopped;
 }
 
-json_t *w_root_watch_list_to_json(void) {
-  w_ht_iter_t iter;
-  json_t *arr;
+json_ref w_root_watch_list_to_json() {
+  auto arr = json_array();
 
-  arr = json_array();
-
-  pthread_mutex_lock(&watch_list_lock);
-  if (w_ht_first(watched_roots, &iter)) do {
-    auto root = (w_root_t *)w_ht_val_ptr(iter.value);
+  auto map = watched_roots.rlock();
+  for (const auto& it : *map) {
+    auto root = it.second;
     json_array_append_new(arr, w_string_to_json(root->root_path));
-  } while (w_ht_next(watched_roots, &iter));
-  pthread_mutex_unlock(&watch_list_lock);
+  }
 
   return arr;
 }
 
-bool w_root_save_state(json_t *state) {
-  w_ht_iter_t root_iter;
+json_ref watchman_root::getStatusForAllRoots() {
+  auto arr = json_array();
+
+  auto map = watched_roots.rlock();
+  for (const auto& it : *map) {
+    auto root = it.second;
+    json_array_append_new(arr, root->getStatus());
+  }
+
+  return arr;
+}
+
+bool w_root_save_state(json_ref& state) {
   bool result = true;
-  json_t *watched_dirs;
 
-  watched_dirs = json_array();
+  auto watched_dirs = json_array();
 
-  w_log(W_LOG_DBG, "saving state\n");
+  logf(DBG, "saving state\n");
 
-  pthread_mutex_lock(&watch_list_lock);
-  if (w_ht_first(watched_roots, &root_iter)) do {
-    json_t *obj;
-    json_t *triggers;
-    struct read_locked_watchman_root lock;
-    struct unlocked_watchman_root unlocked = {
-        (w_root_t*)w_ht_val_ptr(root_iter.value)};
+  {
+    auto map = watched_roots.rlock();
+    for (const auto& it : *map) {
+      auto root = it.second;
 
-    obj = json_object();
+      auto obj = json_object();
 
-    json_object_set_new(obj, "path",
-                        w_string_to_json(unlocked.root->root_path));
+      json_object_set_new(obj, "path", w_string_to_json(root->root_path));
 
-    w_root_read_lock(&unlocked, "w_root_save_state", &lock);
-    triggers = w_root_trigger_list_to_json(&lock);
-    w_root_read_unlock(&lock, &unlocked);
-    json_object_set_new(obj, "triggers", triggers);
+      auto triggers = root->triggerListToJson();
+      json_object_set_new(obj, "triggers", std::move(triggers));
 
-    json_array_append_new(watched_dirs, obj);
+      json_array_append_new(watched_dirs, std::move(obj));
+    }
+  }
 
-  } while (w_ht_next(watched_roots, &root_iter));
-
-  pthread_mutex_unlock(&watch_list_lock);
-
-  json_object_set_new(state, "watched", watched_dirs);
+  json_object_set_new(state, "watched", std::move(watched_dirs));
 
   return result;
 }
 
-json_t *w_root_trigger_list_to_json(struct read_locked_watchman_root *lock) {
-  w_ht_iter_t iter;
-  json_t *arr;
+json_ref watchman_root::getStatus() const {
+  auto obj = json_object();
+  auto now = std::chrono::steady_clock::now();
 
-  arr = json_array();
-  if (w_ht_first(lock->root->commands, &iter)) do {
-    auto cmd = (watchman_trigger_command *)w_ht_val_ptr(iter.value);
+  auto cookie_array = json_array();
+  for (auto& name : cookies.getOutstandingCookieFileList()) {
+    cookie_array.array().push_back(w_string_to_json(name));
+  }
 
-    json_array_append(arr, cmd->definition);
-  } while (w_ht_next(lock->root->commands, &iter));
+  std::string crawl_status;
+  auto recrawl_info = json_object();
+  {
+    auto info = recrawlInfo.rlock();
+    recrawl_info.set({
+        {"count", json_integer(info->recrawlCount)},
+        {"should-recrawl", json_boolean(info->shouldRecrawl)},
+        {"warning", w_string_to_json(info->warning)},
+    });
+
+    if (!inner.done_initial) {
+      crawl_status = folly::to<std::string>(
+          info->recrawlCount ? "re-" : "",
+          "crawling for ",
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - info->crawlStart)
+              .count(),
+          "ms");
+    } else if (info->shouldRecrawl) {
+      crawl_status = folly::to<std::string>(
+          "needs recrawl: ",
+          info->warning,
+          ". Last crawl was ",
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - info->crawlFinish)
+              .count(),
+          "ms ago");
+    } else {
+      crawl_status = folly::to<std::string>(
+          "crawl completed ",
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - info->crawlFinish)
+              .count(),
+          "ms ago, and took ",
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              info->crawlFinish - info->crawlStart)
+              .count(),
+          "ms");
+    }
+  }
+
+  auto query_info = json_array();
+  {
+    auto locked = queries.rlock();
+    for (auto& ctx : *locked) {
+      auto info = json_object();
+      auto elapsed = now - ctx->created;
+
+      const char* queryState = "?";
+      switch (ctx->state.load()) {
+        case QueryContextState::NotStarted:
+          queryState = "NotStarted";
+          break;
+        case QueryContextState::WaitingForCookieSync:
+          queryState = "WaitingForCookieSync";
+          break;
+        case QueryContextState::WaitingForViewLock:
+          queryState = "WaitingForViewLock";
+          break;
+        case QueryContextState::Generating:
+          queryState = "Generating";
+          break;
+        case QueryContextState::Rendering:
+          queryState = "Rendering";
+          break;
+        case QueryContextState::Completed:
+          queryState = "Completed";
+          break;
+      }
+
+      info.set({
+          {"elapsed-milliseconds",
+           json_integer(
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                   .count())},
+          {"cookie-sync-duration-milliseconds",
+           json_integer(ctx->cookieSyncDuration.load().count())},
+          {"generation-duration-milliseconds",
+           json_integer(ctx->generationDuration.load().count())},
+          {"render-duration-milliseconds",
+           json_integer(ctx->renderDuration.load().count())},
+          {"view-lock-wait-duration-milliseconds",
+           json_integer(ctx->viewLockWaitDuration.load().count())},
+          {"state", typed_string_to_json(queryState)},
+          {"client-pid", json_integer(ctx->query->clientPid)},
+          {"request-id", w_string_to_json(ctx->query->request_id)},
+          {"query", json_ref(ctx->query->query_spec)},
+      });
+      if (ctx->query->subscriptionName) {
+        info.set(
+            "subscription-name",
+            w_string_to_json(ctx->query->subscriptionName));
+      }
+
+      query_info.array().push_back(info);
+    }
+  }
+
+  auto cookiePrefix = cookies.cookiePrefix();
+  auto jsonCookiePrefix = json_array();
+  for (const auto& name : cookiePrefix) {
+    jsonCookiePrefix.array().push_back(w_string_to_json(name));
+  }
+
+  auto cookieDirs = cookies.cookieDirs();
+  auto jsonCookieDirs = json_array();
+  for (const auto& dir : cookieDirs) {
+    jsonCookieDirs.array().push_back(w_string_to_json(dir));
+  }
+
+  obj.set({
+      {"path", w_string_to_json(root_path)},
+      {"fstype", w_string_to_json(fs_type)},
+      {"case_sensitive",
+       json_boolean(case_sensitive == CaseSensitivity::CaseSensitive)},
+      {"cookie_prefix", std::move(jsonCookiePrefix)},
+      {"cookie_dir", std::move(jsonCookieDirs)},
+      {"cookie_list", std::move(cookie_array)},
+      {"recrawl_info", std::move(recrawl_info)},
+      {"queries", std::move(query_info)},
+      {"done_initial", json_boolean(inner.done_initial)},
+      {"cancelled", json_boolean(inner.cancelled)},
+      {"crawl-status",
+       w_string_to_json(w_string(crawl_status.data(), crawl_status.size()))},
+  });
+  return obj;
+}
+
+json_ref watchman_root::triggerListToJson() const {
+  auto arr = json_array();
+  {
+    auto map = triggers.rlock();
+    for (const auto& it : *map) {
+      const auto& cmd = it.second;
+      json_array_append(arr, cmd->definition);
+    }
+  }
 
   return arr;
 }
 
-bool w_root_load_state(json_t *state) {
-  json_t *watched;
+bool w_root_load_state(const json_ref& state) {
   size_t i;
 
-  watched = json_object_get(state, "watched");
+  auto watched = state.get_default("watched");
   if (!watched) {
     return true;
   }
 
-  if (!json_is_array(watched)) {
+  if (!watched.isArray()) {
     return false;
   }
 
   for (i = 0; i < json_array_size(watched); i++) {
-    json_t *obj = json_array_get(watched, i);
+    const auto& obj = watched.at(i);
     bool created = false;
-    const char *filename;
-    json_t *triggers;
+    const char* filename;
     size_t j;
-    char *errmsg = NULL;
-    struct write_locked_watchman_root lock;
-    struct unlocked_watchman_root unlocked;
 
-    triggers = json_object_get(obj, "triggers");
+    auto triggers = obj.get_default("triggers");
     filename = json_string_value(json_object_get(obj, "path"));
-    if (!root_resolve(filename, true, &created, &errmsg, &unlocked)) {
-      free(errmsg);
+
+    std::shared_ptr<watchman_root> root;
+    try {
+      root = root_resolve(filename, true, &created);
+    } catch (const std::exception&) {
       continue;
     }
 
-    w_root_lock(&unlocked, "w_root_load_state", &lock);
+    {
+      auto wlock = root->triggers.wlock();
+      auto& map = *wlock;
 
-    /* re-create the trigger configuration */
-    for (j = 0; j < json_array_size(triggers); j++) {
-      json_t *tobj = json_array_get(triggers, j);
-      json_t *rarray;
-      struct watchman_trigger_command *cmd;
+      /* re-create the trigger configuration */
+      for (j = 0; j < json_array_size(triggers); j++) {
+        const auto& tobj = triggers.at(j);
 
-      // Legacy rules format
-      rarray = json_object_get(tobj, "rules");
-      if (rarray) {
-        continue;
+        // Legacy rules format
+        auto rarray = tobj.get_default("rules");
+        if (rarray) {
+          continue;
+        }
+
+        try {
+          auto cmd = std::make_unique<watchman_trigger_command>(root, tobj);
+          cmd->start(root);
+          auto& mapEntry = map[cmd->triggername];
+          mapEntry = std::move(cmd);
+        } catch (const std::exception& exc) {
+          watchman::log(
+              watchman::ERR,
+              "loading trigger for ",
+              root->root_path,
+              ": ",
+              exc.what(),
+              "\n");
+        }
       }
-
-      cmd = w_build_trigger_from_def(lock.root, tobj, &errmsg);
-      if (!cmd) {
-        w_log(
-            W_LOG_ERR,
-            "loading trigger for %s: %s\n",
-            lock.root->root_path.c_str(),
-            errmsg);
-        free(errmsg);
-        continue;
-      }
-
-      w_ht_replace(lock.root->commands, w_ht_ptr_val(cmd->triggername),
-                   w_ht_ptr_val(cmd));
     }
-    w_root_unlock(&lock, &unlocked);
 
     if (created) {
-      if (!root_start(unlocked.root, &errmsg)) {
-        w_log(
-            W_LOG_ERR,
-            "root_start(%s) failed: %s\n",
-            unlocked.root->root_path.c_str(),
-            errmsg);
-        free(errmsg);
-        w_root_cancel(unlocked.root);
+      try {
+        root->view()->startThreads(root);
+      } catch (const std::exception& e) {
+        watchman::log(
+            watchman::ERR,
+            "root_start(",
+            root->root_path,
+            ") failed: ",
+            e.what(),
+            "\n");
+        root->cancel();
       }
     }
-
-    w_root_delref(&unlocked);
   }
 
   return true;
 }
 
-void w_root_free_watched_roots(void) {
-  w_ht_iter_t root_iter;
+void w_root_free_watched_roots() {
   int last, interval;
   time_t started;
+  std::vector<std::shared_ptr<watchman_root>> roots;
 
-  // Reap any children so that we can release their
-  // references on the root
-  w_reap_children(true);
-
-  pthread_mutex_lock(&watch_list_lock);
-  if (w_ht_first(watched_roots, &root_iter)) do {
-    auto root = (w_root_t *)w_ht_val_ptr(root_iter.value);
-    if (!w_root_cancel(root)) {
-      signal_root_threads(root);
+  // We want to cancel the list of roots, but need to be careful to avoid
+  // deadlock; make a copy of the set of roots under the lock...
+  {
+    auto map = watched_roots.rlock();
+    for (const auto& it : *map) {
+      roots.emplace_back(it.second);
     }
-  } while (w_ht_next(watched_roots, &root_iter));
-  pthread_mutex_unlock(&watch_list_lock);
+  }
+
+  // ... and cancel them outside of the lock
+  for (auto& root : roots) {
+    if (!root->cancel()) {
+      root->signalThreads();
+    }
+  }
+
+  // release them all so that we don't mess with the number of live_roots
+  // in the code below.
+  roots.clear();
 
   last = live_roots;
   time(&started);
-  w_log(W_LOG_DBG, "waiting for roots to cancel and go away %d\n", last);
+  logf(DBG, "waiting for roots to cancel and go away {}\n", last);
   interval = 100;
   for (;;) {
-    int current = __sync_fetch_and_add(&live_roots, 0);
+    auto current = live_roots.load();
     if (current == 0) {
       break;
     }
     if (time(NULL) > started + 3) {
-      w_log(W_LOG_ERR, "%d roots were still live at exit\n", current);
+      logf(ERR, "{} roots were still live at exit\n", current);
       break;
     }
     if (current != last) {
-      w_log(W_LOG_DBG, "waiting: %d live\n", current);
+      logf(DBG, "waiting: {} live\n", current);
       last = current;
     }
-    usleep(interval);
-    interval = MIN(interval * 2, 1000000);
+    /* sleep override */ std::this_thread::sleep_for(
+        std::chrono::microseconds(interval));
+    interval = std::min(interval * 2, 1000000);
   }
 
-  w_log(W_LOG_DBG, "all roots are gone\n");
+  logf(DBG, "all roots are gone\n");
 }
 
 /* vim:ts=2:sw=2:et:

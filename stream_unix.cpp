@@ -2,180 +2,328 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#ifdef HAVE_UCRED_H
+#include <ucred.h>
+#endif
 #ifdef HAVE_SYS_UCRED_H
 #include <sys/ucred.h>
 #endif
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
+#include <folly/SocketAddress.h>
+#include <folly/net/NetworkSocket.h>
+#include <memory>
+#include "FileDescriptor.h"
+#include "Pipe.h"
 
-struct watchman_event {
-  int fd[2];
-  bool is_pipe;
+using watchman::FileDescriptor;
+using watchman::Pipe;
+using namespace watchman;
+
+static const int kWriteTimeout = 60000;
+
+namespace {
+// This trait allows w_poll_events to wait on either a PipeEvent or
+// a descriptor contained in a UnixStream
+class PollableEvent : public watchman_event {
+ public:
+  virtual FileDescriptor::system_handle_type getFd() const = 0;
 };
 
-struct unix_handle {
-  int fd;
-  struct watchman_event evt;
+// The event object, implemented as pipe
+class PipeEvent : public PollableEvent {
+ public:
+  SocketPair pipe;
+
+  void notify() override {
+    ignore_result(pipe.write.write("a", 1).hasValue());
+  }
+
+  bool testAndClear() override {
+    char buf[64];
+    bool signalled = false;
+    while (true) {
+      auto res = pipe.read.read(buf, sizeof(buf));
+      if (res.hasError() || res.value() == 0) {
+        break;
+      }
+      signalled = true;
+    }
+    return signalled;
+  }
+
+  FileDescriptor::system_handle_type getFd() const override {
+    return pipe.read.system_handle();
+  }
+
+  FileDescriptor::system_handle_type system_handle() override {
+    return pipe.read.system_handle();
+  }
+
+  bool isSocket() override {
+    return true;
+  }
 };
 
-static int unix_close(w_stm_t stm) {
-  auto h = (unix_handle*)stm->handle;
-  int res;
+// Event object that UnixStream returns via getEvents.
+// It cannot be poked by hand; it is just a helper to
+// allow waiting on a socket using w_poll_events.
+class FakeSocketEvent : public PollableEvent {
+ private:
+  FileDescriptor::system_handle_type socket;
 
-  res = close(h->fd);
-  if (res == 0) {
-    free(h);
-    stm->handle = NULL;
+ public:
+  explicit FakeSocketEvent(FileDescriptor::system_handle_type fd)
+      : socket(fd) {}
+
+  void notify() override {}
+  bool testAndClear() override {
+    return false;
   }
-  return res;
-}
-
-static int unix_read(w_stm_t stm, void *buf, int size) {
-  auto h = (unix_handle*)stm->handle;
-  errno = 0;
-  return read(h->fd, buf, size);
-}
-
-static int unix_write(w_stm_t stm, const void *buf, int size) {
-  auto h = (unix_handle*)stm->handle;
-  errno = 0;
-  return write(h->fd, buf, size);
-}
-
-static void unix_get_events(w_stm_t stm, w_evt_t *readable) {
-  auto h = (unix_handle*)stm->handle;
-  *readable = &h->evt;
-}
-
-static void unix_set_nonb(w_stm_t stm, bool nonb) {
-  auto h = (unix_handle*)stm->handle;
-  if (nonb) {
-    w_set_nonblock(h->fd);
-  } else {
-    w_clear_nonblock(h->fd);
+  FileDescriptor::system_handle_type getFd() const override {
+    return socket;
   }
-}
 
-static bool unix_rewind(w_stm_t stm) {
-  auto h = (unix_handle*)stm->handle;
-  return lseek(h->fd, 0, SEEK_SET) == 0;
-}
+  FileDescriptor::system_handle_type system_handle() override {
+    return socket;
+  }
 
-static bool unix_shutdown(w_stm_t stm) {
-  auto h = (unix_handle*)stm->handle;
-  return shutdown(h->fd, SHUT_RDWR);
-}
+  bool isSocket() override {
+    return true;
+  }
+};
 
-static bool unix_peer_is_owner(w_stm_t stm) {
-  auto h = (unix_handle*)stm->handle;
+class UnixStream : public watchman_stream {
+ public:
+  FileDescriptor fd;
+  FakeSocketEvent evt;
+#ifdef SO_PEERCRED
+  struct ucred cred;
+#elif defined(LOCAL_PEERCRED)
+  struct xucred cred;
+  pid_t epid;
+#elif defined(SO_RECVUCRED)
+  struct ucred_deleter {
+    void operator()(ucred_t* utp) {
+      ucred_free(utp);
+    }
+  };
+  std::unique_ptr<ucred_t, ucred_deleter> cred;
+#endif
+  bool credvalid{false};
+  bool blocking_{false};
+
+  explicit UnixStream(FileDescriptor&& descriptor)
+      : fd(std::move(descriptor)), evt(fd.system_handle()) {
+#ifdef SO_PEERCRED
+    socklen_t len = sizeof(cred);
+    credvalid = getsockopt(fd.fd(), SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0;
+#elif defined(LOCAL_PEERCRED)
+    socklen_t len = sizeof(cred);
+#if defined(__FreeBSD__) || defined(__DragonFly__)
+    credvalid = getsockopt(fd.fd(), 0, LOCAL_PEERCRED, &cred, &len) == 0;
+#else
+    credvalid =
+        getsockopt(fd.fd(), SOL_LOCAL, LOCAL_PEERCRED, &cred, &len) == 0;
+#endif
+    if (credvalid) {
+      len = sizeof(epid);
+      credvalid =
+          getsockopt(fd.fd(), SOL_LOCAL, LOCAL_PEEREPID, &epid, &len) == 0;
+    }
+#elif defined(SO_RECVUCRED)
+    ucred_t* peer_cred{nullptr};
+    credvalid = getpeerucred(fd.fd(), &peer_cred) == 0;
+    cred.reset(peer_cred);
+#endif
+  }
+
+  const FileDescriptor& getFileDescriptor() const override {
+    return fd;
+  }
+
+  int read(void* buf, int size) override {
+    auto res = fd.read(buf, size);
+    if (res.hasError()) {
+#ifdef _WIN32
+      errno = map_win32_err(res.error().value());
+#else
+      errno = res.error().value();
+#endif
+      return -1;
+    }
+    errno = 0;
+    return res.value();
+  }
+
+  int write(const void* buf, int size) override {
+    if (blocking_) {
+      int wrote = 0;
+
+      while (size > 0) {
+        struct pollfd pfd;
+        pfd.fd = fd.system_handle();
+        pfd.events = POLLOUT;
+#ifdef _WIN32
+        if (WSAPoll(&pfd, 1, kWriteTimeout) == 0) {
+          errno = map_win32_err(WSAGetLastError());
+          break;
+        }
+#else
+        if (poll(&pfd, 1, kWriteTimeout) == 0) {
+          break;
+        }
+#endif
+        if (pfd.revents & (POLLERR | POLLHUP)) {
+          break;
+        }
+        auto x = fd.write(buf, size);
+        if (x.hasError()) {
+#ifdef _WIN32
+          errno = map_win32_err(x.error().value());
+#else
+          errno = x.error().value();
+#endif
+          break;
+        }
+        if (x.value() == 0) {
+          errno = 0;
+          break;
+        }
+
+        wrote += x.value();
+        size -= x.value();
+        buf = reinterpret_cast<const void*>(
+            reinterpret_cast<const char*>(buf) + x.value());
+      }
+      return wrote == 0 ? -1 : wrote;
+    }
+    auto x = fd.write(buf, size);
+    if (x.hasError()) {
+#ifdef _WIN32
+      errno = map_win32_err(x.error().value());
+#else
+      errno = x.error().value();
+#endif
+      return -1;
+    }
+    errno = 0;
+    return x.value();
+  }
+
+  w_evt_t getEvents() override {
+    return &evt;
+  }
+
+  void setNonBlock(bool nonb) override {
+    if (nonb) {
+      fd.setNonBlock();
+    } else {
+      fd.clearNonBlock();
+    }
+    blocking_ = !nonb;
+  }
+
+  bool rewind() override {
+#ifndef _WIN32
+    return lseek(fd.fd(), 0, SEEK_SET) == 0;
+#else
+    return false;
+#endif
+  }
+
+  bool shutdown() override {
+    return ::shutdown(
+        fd.system_handle(),
+#ifdef SHUT_RDWR
+        SHUT_RDWR
+#else
+        SD_BOTH
+#endif
+    );
+  }
 
   // For these PEERCRED things, the uid reported is the effective uid of
   // the process, which may have been altered due to setuid or similar
   // mechanisms.  We'll treat the other process as an owner if their
   // effective UID matches ours, or if they are root.
+  bool peerIsOwner() override {
+#ifdef _WIN32
+    return true;
+#else
+    if (!credvalid) {
+      return false;
+    }
 #ifdef SO_PEERCRED
-  struct ucred cred;
-  socklen_t len = sizeof(cred);
-
-  if (getsockopt(h->fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
     if (cred.uid == getuid() || cred.uid == 0) {
       return true;
     }
-  }
 #elif defined(LOCAL_PEERCRED)
-  struct xucred cred;
-  socklen_t len = sizeof(cred);
-
-  if (getsockopt(h->fd, SOL_LOCAL, LOCAL_PEERCRED, &cred, &len) == 0) {
     if (cred.cr_uid == getuid() || cred.cr_uid == 0) {
       return true;
     }
-  }
+#elif defined(SO_RECVUCRED)
+    uid_t ucreduid = ucred_getruid(cred.get());
+    if (ucreduid == getuid() || ucreduid == 0) {
+      return true;
+    }
 #endif
-
-  return false;
-}
-
-static struct watchman_stream_ops unix_ops = {
-  unix_close,
-  unix_read,
-  unix_write,
-  unix_get_events,
-  unix_set_nonb,
-  unix_rewind,
-  unix_shutdown,
-  unix_peer_is_owner,
-};
-
-w_evt_t w_event_make(void) {
-  w_evt_t evt = (w_evt_t)calloc(1, sizeof(*evt));
-  if (!evt) {
-    return NULL;
-  }
-  if (pipe(evt->fd)) {
-    free(evt);
-    return NULL;
-  }
-  w_set_cloexec(evt->fd[0]);
-  w_set_nonblock(evt->fd[0]);
-  w_set_cloexec(evt->fd[1]);
-  w_set_nonblock(evt->fd[1]);
-  evt->is_pipe = true;
-  return evt;
-}
-
-void w_event_set(w_evt_t evt) {
-  if (!evt->is_pipe) {
-    return;
-  }
-  ignore_result(write(evt->fd[1], "a", 1));
-}
-
-void w_event_destroy(w_evt_t evt) {
-  if (!evt->is_pipe) {
-    return;
-  }
-  close(evt->fd[0]);
-  close(evt->fd[1]);
-  free(evt);
-}
-
-bool w_event_test_and_clear(w_evt_t evt) {
-  char buf[64];
-  bool signalled = false;
-  if (!evt->is_pipe) {
     return false;
+#endif
   }
-  while (read(evt->fd[0], buf, sizeof(buf)) > 0) {
-    signalled = true;
-  }
-  return signalled;
-}
 
-int w_stm_fileno(w_stm_t stm) {
-  auto h = (unix_handle*)stm->handle;
-  return h->fd;
+  pid_t getPeerProcessID() const override {
+    if (!credvalid) {
+      return 0;
+    }
+#ifdef SO_PEERCRED
+    return cred.pid;
+#elif defined(LOCAL_PEERCRED)
+    return epid;
+#elif defined(SO_RECVUCRED)
+    pid_t ucredpid = ucred_getpid(cred.get());
+    if (ucredpid == (pid_t)-1) {
+      return 0;
+    }
+    return ucredpid;
+#else
+    return 0;
+#endif
+  }
+};
+} // namespace
+
+std::unique_ptr<watchman_event> w_event_make_sockets() {
+  return std::make_unique<PipeEvent>();
 }
 
 #define MAX_POLL_EVENTS 63 // Must match MAXIMUM_WAIT_OBJECTS-1 on win
-int w_poll_events(struct watchman_event_poll *p, int n, int timeoutms) {
+int w_poll_events_sockets(struct watchman_event_poll* p, int n, int timeoutms) {
   struct pollfd pfds[MAX_POLL_EVENTS];
   int i;
   int res;
 
   if (n > MAX_POLL_EVENTS) {
     // Programmer error :-/
-    w_log(W_LOG_FATAL, "%d > MAX_POLL_EVENTS (%d)\n", n, MAX_POLL_EVENTS);
+    logf(FATAL, "{} > MAX_POLL_EVENTS ({})\n", n, MAX_POLL_EVENTS);
   }
 
   for (i = 0; i < n; i++) {
-    pfds[i].fd = p[i].evt->fd[0];
-    pfds[i].events = POLLIN|POLLHUP|POLLERR;
+    auto pe = dynamic_cast<PollableEvent*>(p[i].evt);
+    w_check(pe != nullptr, "PollableEvent!?");
+    pfds[i].fd = pe->getFd();
+    pfds[i].events = POLLIN;
     pfds[i].revents = 0;
   }
 
+#ifdef _WIN32
+  res = WSAPoll(pfds, n, timeoutms);
+  auto win_err = WSAGetLastError();
+  errno = map_win32_err(win_err);
+#else
   res = poll(pfds, n, timeoutms);
+#endif
 
   for (i = 0; i < n; i++) {
     p[i].ready = pfds[i].revents != 0;
@@ -184,85 +332,85 @@ int w_poll_events(struct watchman_event_poll *p, int n, int timeoutms) {
   return res;
 }
 
-w_stm_t w_stm_fdopen(int fd) {
-  w_stm_t stm;
-  struct unix_handle *h;
-
-  stm = (w_stm_t)calloc(1, sizeof(*stm));
-  if (!stm) {
-    return NULL;
+std::unique_ptr<watchman_stream> w_stm_fdopen(FileDescriptor&& fd) {
+  if (!fd) {
+    return nullptr;
   }
-
-  h = (unix_handle*)calloc(1, sizeof(*h));
-  if (!h) {
-    free(stm);
-    return NULL;
+#ifdef _WIN32
+  if (fd.fdType() != FileDescriptor::FDType::Socket) {
+    return w_stm_fdopen_windows(std::move(fd));
   }
-
-  h->fd = fd;
-
-  stm->handle = h;
-  stm->ops = &unix_ops;
-  h->evt.fd[0] = h->fd;
-  h->evt.fd[1] = h->fd;
-  h->evt.is_pipe = false;
-
-  return stm;
+#endif
+  return std::make_unique<UnixStream>(std::move(fd));
 }
 
-w_stm_t w_stm_connect_unix(const char *path, int timeoutms) {
-  w_stm_t stm;
-  struct sockaddr_un un;
+std::unique_ptr<watchman_stream> w_stm_connect_unix(
+    const char* path,
+    int timeoutms) {
+  struct sockaddr_un un {};
   int max_attempts = timeoutms / 10;
   int attempts = 0;
-  int bufsize = WATCHMAN_IO_BUF_SIZE;
-  int fd;
 
   if (strlen(path) >= sizeof(un.sun_path) - 1) {
-    w_log(W_LOG_ERR, "w_stm_connect_unix(%s) path is too long\n", path);
+    logf(ERR, "w_stm_connect_unix({}) path is too long\n", path);
     errno = E2BIG;
     return NULL;
   }
 
-  fd = socket(PF_LOCAL, SOCK_STREAM, 0);
-  if (fd == -1) {
-    return NULL;
+  FileDescriptor fd(
+      ::socket(
+          PF_LOCAL,
+#ifdef SOCK_CLOEXEC
+          SOCK_CLOEXEC |
+#endif
+              SOCK_STREAM,
+          0),
+      FileDescriptor::FDType::Socket);
+  if (!fd) {
+    return nullptr;
   }
+  fd.setCloExec();
 
-  memset(&un, 0, sizeof(un));
   un.sun_family = PF_LOCAL;
-  strcpy(un.sun_path, path);
+  memcpy(un.sun_path, path, strlen(path) + 1);
 
 retry_connect:
 
-  if (connect(fd, (struct sockaddr*)&un, sizeof(un))) {
+  if (::connect(fd.system_handle(), (struct sockaddr*)&un, sizeof(un))) {
+#ifdef _WIN32
+    int win_err = WSAGetLastError();
+    int err = map_win32_err(win_err);
+#else
     int err = errno;
+#endif
 
     if (err == ECONNREFUSED || err == ENOENT) {
       if (attempts++ < max_attempts) {
-        usleep(10000);
+        /* sleep override */ std::this_thread::sleep_for(
+            std::chrono::microseconds(10000));
         goto retry_connect;
       }
     }
 
-    close(fd);
-    return NULL;
+    errno = err;
+    return nullptr;
   }
 
-  setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
-      (void*)&bufsize, sizeof(bufsize));
+  int bufsize = WATCHMAN_IO_BUF_SIZE;
+  ::setsockopt(
+      fd.system_handle(),
+      SOL_SOCKET,
+      SO_RCVBUF,
+      reinterpret_cast<const char*>(&bufsize),
+      sizeof(bufsize));
 
-  stm = w_stm_fdopen(fd);
-  if (!stm) {
-    close(fd);
-  }
-  return stm;
+  return w_stm_fdopen(std::move(fd));
 }
 
-w_stm_t w_stm_open(const char *filename, int flags, ...) {
+#ifndef _WIN32
+std::unique_ptr<watchman_stream>
+w_stm_open(const char* filename, int flags, ...) {
   int mode = 0;
-  int fd;
-  w_stm_t stm;
 
   // If we're creating, pull out the mode flag
   if (flags & O_CREAT) {
@@ -272,14 +420,7 @@ w_stm_t w_stm_open(const char *filename, int flags, ...) {
     va_end(ap);
   }
 
-  fd = open(filename, flags, mode);
-  if (fd == -1) {
-    return NULL;
-  }
-
-  stm = w_stm_fdopen(fd);
-  if (!stm) {
-    close(fd);
-  }
-  return stm;
+  return w_stm_fdopen(FileDescriptor(
+      open(filename, flags, mode), FileDescriptor::FDType::Unknown));
 }
+#endif

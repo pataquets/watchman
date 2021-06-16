@@ -2,20 +2,17 @@
  * Licensed under the Apache License, Version 2.0 */
 #pragma once
 
+#include "Clock.h"
+#include "FileInformation.h"
+
 struct watchman_file {
   /* the parent dir */
-  watchman_dir *parent;
+  watchman_dir* parent;
 
   /* linkage to files ordered by changed time.
    * prev points to the address of `next` in the
    * previous file node, or the head of the list. */
   struct watchman_file **prev, *next;
-
-  /* linkage to files ordered by common suffix.
-   * suffix_prev points to the address of `suffix_next`
-   * in the previous file node, or the head of the
-   * suffix list. */
-  struct watchman_file **suffix_prev, *suffix_next;
 
   /* the time we last observed a change to this file */
   w_clock_t otime;
@@ -31,13 +28,24 @@ struct watchman_file {
 
   /* cache stat results so we can tell if an entry
    * changed */
-  struct watchman_stat stat;
+  watchman::FileInformation stat;
 
-  /* the symbolic link target of this file.
-   * Can be NULL if not a symlink, or we failed to read the target */
-  w_string symlink_target;
+  inline w_string_piece getName() const {
+    uint32_t len;
+    memcpy(&len, this + 1, 4);
+    return w_string_piece(reinterpret_cast<const char*>(this + 1) + 4, len);
+  }
+
+  void removeFromFileList();
+
+  watchman_file() = delete;
+  watchman_file(const watchman_file&) = delete;
+  watchman_file& operator=(const watchman_file&) = delete;
+  ~watchman_file();
+
+  static std::unique_ptr<watchman_file, watchman_dir::Deleter> make(
+      const w_string& name,
+      watchman_dir* parent);
 };
 
-static inline w_string_t *w_file_get_name(struct watchman_file *file) {
-  return (w_string_t*)(file + 1);
-}
+void free_file_node(struct watchman_file* file);

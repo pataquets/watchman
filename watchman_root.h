@@ -1,311 +1,239 @@
 /* Copyright 2012-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 #pragma once
+#include <folly/Synchronized.h>
+#include <atomic>
+#include <condition_variable>
 #include <unordered_map>
+#include "CookieSync.h"
+#include "FileSystem.h"
+#include "PubSub.h"
+#include "QueryableView.h"
+#include "watchman_config.h"
 
-#define HINT_NUM_DIRS 128*1024
+#define HINT_NUM_DIRS 128 * 1024
 #define CFG_HINT_NUM_DIRS "hint_num_dirs"
 
 #define DEFAULT_SETTLE_PERIOD 20
-#define DEFAULT_QUERY_SYNC_MS 60000
+constexpr std::chrono::milliseconds DEFAULT_QUERY_SYNC_MS(60000);
 
 /* Prune out nodes that were deleted roughly 12-36 hours ago */
-#define DEFAULT_GC_AGE (86400/2)
+#define DEFAULT_GC_AGE (86400 / 2)
 #define DEFAULT_GC_INTERVAL 86400
 
 /* Idle out watches that haven't had activity in several days */
-#define DEFAULT_REAP_AGE (86400*5)
+#define DEFAULT_REAP_AGE (86400 * 5)
 
-#define WATCHMAN_COOKIE_PREFIX ".watchman-cookie-"
-struct watchman_query_cookie {
-  pthread_cond_t cond;
-  pthread_mutex_t lock;
-  bool seen;
+namespace watchman {
+class ClientStateAssertion;
+
+class ClientStateAssertions {
+ public:
+  /** Returns true if `assertion` is the front instance in the queue
+   * of assertions that match assertion->name */
+  bool isFront(const std::shared_ptr<ClientStateAssertion>& assertion) const;
+
+  /** Returns true if `assertion` currently has an Asserted disposition */
+  bool isStateAsserted(w_string stateName) const;
+
+  /** Add assertion to the queue of assertions for assertion->name.
+   * Throws if the named state is already asserted or if there is
+   * a pending assertion for that state. */
+  void queueAssertion(std::shared_ptr<ClientStateAssertion> assertion);
+
+  /** remove assertion from the queue of assertions for assertion->name.
+   * If no more assertions remain in that named queue then the queue is
+   * removed.
+   * If the removal of an assertion causes the new front of that queue
+   * to occupied by an assertion with Asserted disposition, generates a
+   * broadcast of its enterPayload.
+   */
+  bool removeAssertion(const std::shared_ptr<ClientStateAssertion>& assertion);
+
+  /** Returns some diagnostic information that is used by
+   * the integration tests. */
+  json_ref debugStates() const;
+
+ private:
+  /** states_ maps from a state name to a queue of assertions with
+   * various dispositions */
+  std::
+      unordered_map<w_string, std::deque<std::shared_ptr<ClientStateAssertion>>>
+          states_;
 };
+} // namespace watchman
 
-struct watchman_root {
-  long refcnt{1};
-
+struct watchman_root : public std::enable_shared_from_this<watchman_root> {
   /* path to root */
   w_string root_path;
-  bool case_sensitive{false};
-
-  /* our locking granularity is per-root */
-  pthread_rwlock_t lock;
-  const char *lock_reason{nullptr};
-  pthread_t notify_thread;
-  pthread_t io_thread;
+  /* filesystem type name, as returned by w_fstype() */
+  const w_string fs_type;
+  watchman::CaseSensitivity case_sensitive;
 
   /* map of rule id => struct watchman_trigger_command */
-  w_ht_t *commands{nullptr};
+  folly::Synchronized<
+      std::unordered_map<w_string, std::unique_ptr<watchman_trigger_command>>>
+      triggers;
 
-  /* path to the query cookie dir */
-  w_string query_cookie_dir;
-  w_string query_cookie_prefix;
-  std::unordered_map<w_string, watchman_query_cookie*> query_cookies;
+  watchman::CookieSync cookies;
 
   struct watchman_ignore ignore;
 
-  int trigger_settle{0};
-  int gc_interval{0};
-  int gc_age{0};
-  int idle_reap_age{0};
-
   /* config options loaded via json file */
-  json_t *config_file{nullptr};
+  json_ref config_file;
+  Configuration config;
 
-  /* how many times we've had to recrawl */
-  int recrawl_count{0};
-  w_string last_recrawl_reason;
+  const int trigger_settle{0};
+  /**
+   * Don't GC more often than this.
+   *
+   * If zero, then never age out.
+   */
+  const std::chrono::seconds gc_interval{DEFAULT_GC_INTERVAL};
+  /**
+   * When GCing, age out files older than this.
+   */
+  const std::chrono::seconds gc_age{DEFAULT_GC_AGE};
+  const int idle_reap_age{0};
+
+  // Stream of broadcast unilateral items emitted by this root
+  std::shared_ptr<watchman::Publisher> unilateralResponses;
+
+  struct RecrawlInfo {
+    /* how many times we've had to recrawl */
+    int recrawlCount{0};
+    /* if true, we've decided that we should re-crawl the root
+     * for the sake of ensuring consistency */
+    bool shouldRecrawl{true};
+    // Last ad-hoc warning message
+    w_string warning;
+    std::chrono::steady_clock::time_point crawlStart;
+    std::chrono::steady_clock::time_point crawlFinish;
+  };
+  folly::Synchronized<RecrawlInfo> recrawlInfo;
 
   // Why we failed to watch
   w_string failure_reason;
 
-  // Last ad-hoc warning message
-  w_string warning;
+  // State transition counter to allow identification of concurrent state
+  // transitions
+  std::atomic<uint32_t> stateTransCount{0};
+  folly::Synchronized<watchman::ClientStateAssertions> assertedStates;
 
-  /* queue of items that we need to stat/process */
-  struct watchman_pending_collection pending;
-
-  // map of state name => watchman_client_state_assertion for
-  // asserted states
-  w_ht_t *asserted_states{nullptr};
-
-  /* the watcher that we're using for this root */
-  struct watchman_ops *watcher_ops{nullptr};
-
-  /* --- everything in inner will be reset on w_root_init --- */
   struct Inner {
-    /* root number */
-    uint32_t number{0};
+    std::shared_ptr<watchman::QueryableView> view_;
 
-    // Watcher specific state
-    watchman_watcher_t watch{0};
-
-    std::unique_ptr<watchman_dir> root_dir;
-
-    /* the most recently changed file */
-    struct watchman_file* latest_file{0};
-
-    /* current tick */
-    uint32_t ticks{1};
-
-    bool done_initial{0};
-    /* if true, we've decided that we should re-crawl the root
-     * for the sake of ensuring consistency */
-    bool should_recrawl{0};
-    bool cancelled{0};
+    /**
+     * Initially false and set to false by the iothread after scheduleRecrawl.
+     * Set true after fullCrawl is done.
+     *
+     * Primarily used by the iothread but this is atomic because other threads
+     * sometimes read it to produce log messages.
+     */
+    std::atomic<bool> done_initial{false};
+    bool cancelled{false};
 
     /* map of cursor name => last observed tick value */
-    w_ht_t* cursors{0};
-
-    /* Holds the list head for files of a given suffix */
-    struct file_list_head {
-      watchman_file* head{nullptr};
-    };
-    /* Holds the list heads for all known suffixes */
-    std::unordered_map<w_string, std::unique_ptr<file_list_head>> suffixes;
+    folly::Synchronized<std::unordered_map<w_string, uint32_t>> cursors;
 
     /* Collection of symlink targets that we try to watch.
      * Reads and writes on this collection are only safe if done from the IO
      * thread; this collection is not protected by the root lock. */
-    struct watchman_pending_collection pending_symlink_targets;
+    PendingCollection pending_symlink_targets;
 
-    uint32_t next_cmd_id{0};
-    uint32_t last_trigger_tick{0};
-    uint32_t pending_trigger_tick{0};
-    uint32_t pending_sub_tick{0};
-    uint32_t last_age_out_tick{0};
-    time_t last_age_out_timestamp{0};
-    time_t last_cmd_timestamp{0};
-    time_t last_reap_timestamp{0};
+    /// Set by connection threads and read on the iothread.
+    std::atomic<std::chrono::steady_clock::time_point> last_cmd_timestamp{
+        std::chrono::steady_clock::time_point{}};
 
-    Inner();
-    ~Inner();
+    /// Only accessed on the iothread.
+    std::chrono::steady_clock::time_point last_reap_timestamp;
+
+    void init(watchman_root* root);
   } inner;
+
+  // For debugging and diagnostic purposes, this set references
+  // all outstanding query contexts that are executing against this root.
+  // If is only safe to read the query contexts while the queries.rlock()
+  // is held, and even then it is only really safe to read fields that
+  // are not changed by the query exection.
+  folly::Synchronized<std::unordered_set<w_query_ctx*>> queries;
+
+  // Obtain the current view pointer.
+  // This is safe wrt. a concurrent recrawl operation
+  std::shared_ptr<watchman::QueryableView> view();
+
+  explicit watchman_root(const w_string& root_path, const w_string& fs_type);
+  ~watchman_root();
+
+  void considerAgeOut();
+  void performAgeOut(std::chrono::seconds min_age);
+  void syncToNow(std::chrono::milliseconds timeout);
+  void scheduleRecrawl(const char* why);
+  void recrawlTriggered(const char* why);
+
+  // Requests cancellation of the root.
+  // Returns true if this request caused the root cancellation, false
+  // if it was already in the process of being cancelled.
+  bool cancel();
+
+  void processPendingSymlinkTargets();
+
+  // Returns true if the caller should stop the watch.
+  bool considerReap();
+  void init();
+  bool removeFromWatched();
+  void applyIgnoreVCSConfiguration();
+  void signalThreads();
+  bool stopWatch();
+  json_ref triggerListToJson() const;
+
+  static json_ref getStatusForAllRoots();
+  json_ref getStatus() const;
+
+ private:
+  void applyIgnoreConfiguration();
 };
 
-struct write_locked_watchman_root {
-  w_root_t *root;
-};
-
-struct read_locked_watchman_root {
-  const w_root_t *root;
-};
-
-/** Massage a write lock into a read lock.
- * This is suitable for passing a write lock to functions that want a
- * read lock.  It works by simply casting the address of the write lock
- * pointer to a read lock pointer.  Casting in this direction is fine,
- * but not casting in the opposite direction.
- * This is safe for a couple of reasons:
- *
- *  1. The read and write lock holders are binary compatible with each
- *     other; they both simply hold a root pointer.
- *  2. The underlying unlock function pthread_rwlock_unlock works regardless
- *     of the read-ness or write-ness of the lock, even though we have
- *     a separate read and write unlock functions.
- *  3. We're careful to pass a pointer to the existing lock instance
- *     around rather than copying it around; that way don't lose track of
- *     the fact that we unlocked the root.
- */
-static inline struct read_locked_watchman_root *
-w_root_read_lock_from_write(struct write_locked_watchman_root *lock) {
-  return (struct read_locked_watchman_root*)lock;
-}
-
-struct unlocked_watchman_root {
-  w_root_t *root;
-};
-
-bool w_root_resolve(
+std::shared_ptr<watchman_root> w_root_resolve(
     const char* path,
-    bool auto_watch,
-    char** errmsg,
-    struct unlocked_watchman_root* unlocked);
-bool w_root_resolve_for_client_mode(
-    const char* filename,
-    char** errmsg,
-    struct unlocked_watchman_root* unlocked);
-char* w_find_enclosing_root(const char* filename, char** relpath);
-struct watchman_file* w_root_resolve_file(
-    struct write_locked_watchman_root* lock,
-    struct watchman_dir* dir,
-    const w_string& file_name,
-    struct timeval now);
+    bool auto_watch);
 
-void w_root_perform_age_out(
-    struct write_locked_watchman_root* lock,
-    int min_age);
-void w_root_free_watched_roots(void);
-void w_root_schedule_recrawl(w_root_t* root, const char* why);
-bool w_root_cancel(w_root_t* root);
-bool w_root_stop_watch(struct unlocked_watchman_root* unlocked);
-json_t* w_root_stop_watch_all(void);
-void w_root_mark_deleted(
-    struct write_locked_watchman_root* lock,
-    struct watchman_dir* dir,
-    struct timeval now,
-    bool recursive);
-void w_root_reap(void);
-void w_root_delref(struct unlocked_watchman_root* unlocked);
-void w_root_delref_raw(w_root_t* root);
-void w_root_addref(w_root_t* root);
-void w_root_set_warning(
-    struct write_locked_watchman_root* lock,
-    const w_string& str);
+std::shared_ptr<watchman_root> w_root_resolve_for_client_mode(
+    const char* filename);
+bool findEnclosingRoot(
+    const w_string& fileName,
+    w_string_piece& prefix,
+    w_string_piece& relativePath);
 
-watchman_dir* w_root_resolve_dir(
-    struct write_locked_watchman_root* lock,
-    const w_string& dir_name,
-    bool create);
-const watchman_dir* w_root_resolve_dir_read(
-    struct read_locked_watchman_root* lock,
-    const w_string& dir_name);
-void w_root_process_path(
-    struct write_locked_watchman_root* root,
-    struct watchman_pending_collection* coll,
-    const w_string& full_path,
-    struct timeval now,
-    int flags,
-    struct watchman_dir_ent* pre_stat);
-bool w_root_process_pending(
-    struct write_locked_watchman_root* lock,
-    struct watchman_pending_collection* coll,
-    bool pull_from_root);
+void w_root_free_watched_roots();
+json_ref w_root_stop_watch_all();
+void w_root_reap();
 
-void w_root_mark_file_changed(
-    struct write_locked_watchman_root* lock,
-    struct watchman_file* file,
-    struct timeval now);
+bool did_file_change(
+    const watchman::FileInformation* saved,
+    const watchman::FileInformation* fresh);
+extern std::atomic<long> live_roots;
 
-bool w_root_sync_to_now(struct unlocked_watchman_root* unlocked, int timeoutms);
+extern folly::Synchronized<
+    std::unordered_map<w_string, std::shared_ptr<watchman_root>>>
+    watched_roots;
 
-void w_root_lock(
-    struct unlocked_watchman_root* unlocked,
-    const char* purpose,
-    struct write_locked_watchman_root* locked);
-bool w_root_lock_with_timeout(
-    struct unlocked_watchman_root* unlocked,
-    const char* purpose,
-    int timeoutms,
-    struct write_locked_watchman_root* locked);
-void w_root_unlock(
-    struct write_locked_watchman_root* locked,
-    struct unlocked_watchman_root* unlocked);
-
-void w_root_read_lock(
-    struct unlocked_watchman_root* unlocked,
-    const char* purpose,
-    struct read_locked_watchman_root* locked);
-bool w_root_read_lock_with_timeout(
-    struct unlocked_watchman_root* unlocked,
-    const char* purpose,
-    int timeoutms,
-    struct read_locked_watchman_root* locked);
-void w_root_read_unlock(
-    struct read_locked_watchman_root* locked,
-    struct unlocked_watchman_root* unlocked);
-
-void process_pending_symlink_targets(struct unlocked_watchman_root* unlocked);
-void* run_io_thread(void* arg);
-void* run_notify_thread(void* arg);
-void process_subscriptions(struct write_locked_watchman_root* lock);
-void process_triggers(struct write_locked_watchman_root* lock);
-void consider_age_out(struct write_locked_watchman_root* lock);
-bool consider_reap(struct write_locked_watchman_root* lock);
-void remove_from_file_list(struct watchman_file* file);
-void free_file_node(struct watchman_file* file);
-void w_root_teardown(w_root_t* root);
-bool w_root_init(w_root_t* root, char** errmsg);
-bool remove_root_from_watched(
-    w_root_t* root /* don't care about locked state */);
-bool is_vcs_op_in_progress(struct write_locked_watchman_root* lock);
-extern const struct watchman_hash_funcs dirname_hash_funcs;
-void delete_dir(struct watchman_dir* dir);
-void crawler(
-    struct write_locked_watchman_root* lock,
-    struct watchman_pending_collection* coll,
-    const w_string& dir_name,
-    struct timeval now,
-    bool recursive);
-void stat_path(
-    struct write_locked_watchman_root* lock,
-    struct watchman_pending_collection* coll,
-    const w_string& full_path,
-    struct timeval now,
-    int flags,
-    struct watchman_dir_ent* pre_stat);
-bool did_file_change(struct watchman_stat *saved, struct watchman_stat *fresh);
-void struct_stat_to_watchman_stat(const struct stat *st,
-                                  struct watchman_stat *target);
-bool apply_ignore_vcs_configuration(w_root_t *root, char **errmsg);
-w_root_t *w_root_new(const char *path, char **errmsg);
-extern volatile long live_roots;
-bool root_start(w_root_t *root, char **errmsg);
-extern pthread_mutex_t watch_list_lock;
-extern w_ht_t *watched_roots;
-bool root_resolve(
-    const char* filename,
-    bool auto_watch,
-    bool* created,
-    char** errmsg,
-    struct unlocked_watchman_root* unlocked);
-void signal_root_threads(w_root_t* root);
+std::shared_ptr<watchman_root>
+root_resolve(const char* filename, bool auto_watch, bool* created);
 
 void set_poison_state(
     const w_string& dir,
-    struct timeval now,
+    std::chrono::system_clock::time_point now,
     const char* syscall,
-    int err,
-    const char* reason);
+    const std::error_code& err);
 
 void handle_open_errno(
-    struct write_locked_watchman_root* lock,
+    watchman_root& root,
     struct watchman_dir* dir,
-    struct timeval now,
+    std::chrono::system_clock::time_point now,
     const char* syscall,
-    int err,
-    const char* reason);
-void stop_watching_dir(struct write_locked_watchman_root *lock,
-                       struct watchman_dir *dir);
+    const std::error_code& err);
+
+inline bool is_edenfs_fs_type(w_string_piece fs_type) {
+  return fs_type == "edenfs" || fs_type.startsWith("edenfs:");
+}

@@ -1,9 +1,10 @@
 ---
-id: cmd.query
+pageid: cmd.query
 title: query
 layout: docs
 section: Commands
 permalink: docs/cmd/query.html
+redirect_from: docs/cmd/query/
 ---
 
 *Since 1.6.*
@@ -62,6 +63,33 @@ fields will return a response something like this:
 }
 ```
 
+If a field's value cannot be computed, a field's value may be `null`, or may
+be an object with an `error` key containing a descriptive message string:
+
+```json
+{
+    "version": "2019-07-22T13:50:36Z",
+    "is_fresh_instance": false,
+    "clock": "c:1563834049:1830370:791543813:2257494",
+    "files": [
+        {
+            "content.sha1hex": null,
+            "name": "docs"
+            "symlink_target": null,
+            "type": "d",
+        },
+        {
+            "content.sha1hex": {
+                "error": "eloop: file is a symlink: Invalid argument: Invalid argument"
+            },
+            "type": "l",
+            "symlink_target": "eloop",
+            "name": "eloop"
+        }
+    ]
+}
+```
+
 For queries using the `since` generator, the `is_fresh_instance` member is true
 if the particular clock value indicates that it was returned by a different
 instance of watchman, or a named cursor hasn't been seen before. In that case,
@@ -115,6 +143,12 @@ microseconds, nanoseconds or floating point seconds respectively.
  * `symlink_target` - string: the target of a symbolic link if the file is a
    symbolic link
 
+*Since 4.9.*
+
+ * `content.sha1hex` - string: the SHA-1 digest of the file's byte content,
+encoded as 40 hexidecimal digits (e.g.
+`"da39a3ee5e6b4b0d3255bfef95601890afd80709"` for an empty file)
+
 ### Synchronization timeout (since 2.1)
 
 By default a `query` will wait for up to 60 seconds for the view of the
@@ -167,7 +201,7 @@ effective value of infinity.
 *Since 2.9.9.*
 
 On systems where the watched root is a case insensitive filesystem (this is the
-common case for OS X and Windows), various name matching operations default to
+common case for macOS and Windows), various name matching operations default to
 case insensitive.
 
 *Since 4.7.*

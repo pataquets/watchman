@@ -15,17 +15,18 @@
  */
 package com.facebook.watchman;
 
+import com.google.common.util.concurrent.MoreExecutors;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.OutputStream;
-import java.net.Socket;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -55,9 +56,9 @@ public class WatchmanClientImpl implements WatchmanClient {
 
   private final Supplier<Boolean> supportsWatchProject;
 
-  public WatchmanClientImpl(Socket socket) throws IOException {
+  public WatchmanClientImpl(WatchmanTransport transport) throws IOException {
     connection = new WatchmanConnection(
-        socket,
+        transport,
         Optional.of(UNILATERAL_LABELS),
         Optional.<Callback>of(new UnilateralCallbackImpl()));
 
@@ -71,12 +72,12 @@ public class WatchmanClientImpl implements WatchmanClient {
 
   @VisibleForTesting
   WatchmanClientImpl(
-      Supplier<Map<String, Object>> inputSupplier,
-      OutputStream outputStream,
+      Callable<Map<String, Object>> incomingMessageGetter,
+      OutputStream outgoingMessageStream,
       Supplier<Boolean> supportsWatchProject) {
     connection = new WatchmanConnection(
-        inputSupplier,
-        outputStream,
+        incomingMessageGetter,
+        outgoingMessageStream,
         Optional.of(UNILATERAL_LABELS),
         Optional.<Callback>of(new UnilateralCallbackImpl()));
 
@@ -149,7 +150,7 @@ public class WatchmanClientImpl implements WatchmanClient {
         }
         return wasDeleted;
       }
-    });
+    }, MoreExecutors.directExecutor());
   }
 
   @Override
@@ -181,7 +182,7 @@ public class WatchmanClientImpl implements WatchmanClient {
             // TODO remove subscription descriptor from `subscriptions` if we got an error from wman
             return result;
           }
-        });
+        }, MoreExecutors.directExecutor());
   }
 
   @Override
@@ -228,7 +229,7 @@ public class WatchmanClientImpl implements WatchmanClient {
           public Boolean apply(@Nullable List<Boolean> input) {
             return !Collections2.filter(input, Predicates.equalTo(false)).isEmpty();
           }
-        });
+        }, MoreExecutors.directExecutor());
   }
 
   /**
@@ -255,11 +256,13 @@ public class WatchmanClientImpl implements WatchmanClient {
             .name(subscriptionId)
             .root(root)
             .build();
-        if (!subscriptions.containsKey(subscription)) {
+
+        Callback listener = subscriptions.get(subscription);
+        if (listener == null) {
           // TODO log error?!
           return;
         }
-        subscriptions.get(subscription).call(message);
+        listener.call(message);
       }
     }
   }

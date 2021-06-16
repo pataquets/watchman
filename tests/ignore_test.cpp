@@ -2,118 +2,118 @@
  * Licensed under the Apache License, Version 2.0. */
 
 #include "watchman.h"
-#include "thirdparty/tap.h"
+#include <folly/logging/xlog.h>
+#include <folly/portability/GTest.h>
 
 // A list that looks similar to one used in one of our repos
-const char *ignore_dirs[] = {".buckd",
-                             ".idea",
-                             "_build",
-                             "buck-cache",
-                             "buck-out",
-                             "build",
-                             "foo/.buckd",
-                             "foo/buck-cache",
-                             "foo/buck-out",
-                             "bar/_build",
-                             "bar/buck-cache",
-                             "bar/buck-out",
-                             "baz/.buckd",
-                             "baz/buck-cache",
-                             "baz/buck-out",
-                             "baz/build",
-                             "baz/qux",
-                             "baz/focus-out",
-                             "baz/tmp",
-                             "baz/foo/bar/foo/build",
-                             "baz/foo/bar/bar/build",
-                             "baz/foo/bar/baz/build",
-                             "baz/foo/bar/qux",
-                             "baz/foo/baz/foo",
-                             "baz/bar/foo/foo/foo/foo/foo/foo",
-                             "baz/bar/bar/foo/foo",
-                             "baz/bar/bar/foo/foo"};
+const char* ignore_dirs[] = {
+    ".buckd",
+    ".idea",
+    "_build",
+    "buck-cache",
+    "buck-out",
+    "build",
+    "foo/.buckd",
+    "foo/buck-cache",
+    "foo/buck-out",
+    "bar/_build",
+    "bar/buck-cache",
+    "bar/buck-out",
+    "baz/.buckd",
+    "baz/buck-cache",
+    "baz/buck-out",
+    "baz/build",
+    "baz/qux",
+    "baz/focus-out",
+    "baz/tmp",
+    "baz/foo/bar/foo/build",
+    "baz/foo/bar/bar/build",
+    "baz/foo/bar/baz/build",
+    "baz/foo/bar/qux",
+    "baz/foo/baz/foo",
+    "baz/bar/foo/foo/foo/foo/foo/foo",
+    "baz/bar/bar/foo/foo",
+    "baz/bar/bar/foo/foo"};
 
-const char *ignore_vcs[] = {".hg", ".svn", ".git"};
+const char* ignore_vcs[] = {".hg", ".svn", ".git"};
 
 struct test_case {
-  const char *path;
+  const char* path;
   bool ignored;
 };
 
-void run_correctness_test(struct watchman_ignore *state,
-                          const struct test_case *tests, uint32_t num_tests,
-                          bool (*checker)(const struct watchman_ignore *,
-                                          const char *, uint32_t)) {
-
+void run_correctness_test(
+    struct watchman_ignore* state,
+    const struct test_case* tests,
+    uint32_t num_tests) {
   uint32_t i;
 
   for (i = 0; i < num_tests; i++) {
-    bool res = checker(state, tests[i].path, strlen_uint32(tests[i].path));
-    ok(res == tests[i].ignored, "%s expected=%d actual=%d", tests[i].path,
-       tests[i].ignored, res);
+    bool res = state->isIgnored(tests[i].path, strlen_uint32(tests[i].path));
+    EXPECT_EQ(res, tests[i].ignored) << tests[i].path;
   }
 }
 
-void add_strings(struct watchman_ignore *ignore, const char **strings,
-                 uint32_t num_strings, bool is_vcs_ignore) {
+void add_strings(
+    struct watchman_ignore* ignore,
+    const char** strings,
+    uint32_t num_strings,
+    bool is_vcs_ignore) {
   uint32_t i;
-  w_string_t *str;
   for (i = 0; i < num_strings; i++) {
-    str = w_string_new_typed(strings[i], W_STRING_UNICODE);
-    w_ignore_addstr(ignore, str, is_vcs_ignore);
-    w_string_delref(str);
+    ignore->add(w_string(strings[i], W_STRING_UNICODE), is_vcs_ignore);
   }
 }
 
-void init_state(struct watchman_ignore *state) {
-  w_ignore_init(state);
+void init_state(struct watchman_ignore* state) {
+  add_strings(
+      state, ignore_dirs, sizeof(ignore_dirs) / sizeof(ignore_dirs[0]), false);
 
-  add_strings(state, ignore_dirs, sizeof(ignore_dirs) / sizeof(ignore_dirs[0]),
-              false);
-
-  add_strings(state, ignore_vcs, sizeof(ignore_vcs) / sizeof(ignore_vcs[0]),
-              true);
+  add_strings(
+      state, ignore_vcs, sizeof(ignore_vcs) / sizeof(ignore_vcs[0]), true);
 }
 
-void test_correctness(void) {
+TEST(Ignore, correctness) {
   struct watchman_ignore state;
   static const struct test_case tests[] = {
-    {"some/path", false},
-    {"buck-out/gen/foo", true},
-    {".hg/wlock", false},
-    {".hg/store/foo", true},
-    {"buck-out", true},
-    {"foo/buck-out", true},
-    {"foo/hello", false},
-    {"baz/hello", false},
-    {".hg", false},
-    {"buil", false},
-    {"build", true},
-    {"build/lower", true},
-    {"builda", false},
-    {"build/bar", true},
-    {"buildfile", false},
-    {"build/lower/baz", true},
-    {"builda/hello", false},
+      {"some/path", false},
+      {"buck-out/gen/foo", true},
+      {".hg/wlock", false},
+      {".hg/store/foo", true},
+      {"buck-out", true},
+      {"foo/buck-out", true},
+      {"foo/hello", false},
+      {"baz/hello", false},
+      {".hg", false},
+      {"buil", false},
+      {"build", true},
+      {"build/lower", true},
+      {"builda", false},
+      {"build/bar", true},
+      {"buildfile", false},
+      {"build/lower/baz", true},
+      {"builda/hello", false},
   };
 
   init_state(&state);
 
-  run_correctness_test(&state, tests, sizeof(tests) / sizeof(tests[0]),
-                       w_ignore_check);
-
-  w_ignore_destroy(&state);
+  run_correctness_test(&state, tests, sizeof(tests) / sizeof(tests[0]));
 }
 
 // Load up the words data file and build a list of strings from that list.
 // Each of those strings is prefixed with the supplied string.
 // If there are fewer than limit entries available in the data file, we will
 // abort.
-w_string_t** build_list_with_prefix(const char *prefix, size_t limit) {
-  auto strings = (w_string_t**)calloc(limit, sizeof(w_string_t*));
+std::vector<w_string> build_list_with_prefix(const char* prefix, size_t limit) {
+  std::vector<w_string> strings;
   char buf[512];
-  FILE *f = fopen("thirdparty/libart/tests/words.txt", "r");
-  size_t i = 0;
+  FILE* f = fopen("thirdparty/libart/tests/words.txt", "r");
+
+#ifdef WATCHMAN_TEST_SRC_DIR
+  if (!f) {
+    f = fopen(WATCHMAN_TEST_SRC_DIR "/thirdparty/libart/tests/words.txt", "r");
+  }
+#endif
 
   if (!f) {
     f = fopen("watchman/thirdparty/libart/tests/words.txt", "r");
@@ -123,69 +123,43 @@ w_string_t** build_list_with_prefix(const char *prefix, size_t limit) {
     // Remove newline
     uint32_t len = strlen_uint32(buf);
     buf[len - 1] = '\0';
-    strings[i++] = w_string_make_printf("%s%s", prefix, buf);
+    strings.emplace_back(w_string::build(prefix, buf));
 
-    if (i >= limit) {
+    if (strings.size() >= limit) {
       break;
     }
   }
 
-  if (i < limit) {
-    abort();
-  }
+  EXPECT_GE(strings.size(), limit);
 
   return strings;
 }
 
 static const size_t kWordLimit = 230000;
 
-void bench_list(const char *label, const char *prefix,
-                bool (*checker)(const struct watchman_ignore *, const char *,
-                                uint32_t)) {
-
+void bench_list(const char* label, const char* prefix) {
   struct watchman_ignore state;
   size_t i, n;
-  w_string_t **strings;
   struct timeval start, end;
 
   init_state(&state);
-  strings = build_list_with_prefix(prefix, kWordLimit);
+  auto strings = build_list_with_prefix(prefix, kWordLimit);
 
   gettimeofday(&start, NULL);
   for (n = 0; n < 100; n++) {
     for (i = 0; i < kWordLimit; i++) {
-      checker(&state, strings[i]->buf, strings[i]->len);
+      state.isIgnored(strings[i].data(), strings[i].size());
     }
   }
   gettimeofday(&end, NULL);
 
-  diag("%s: took %.3fs", label, w_timeval_diff(start, end));
-
-  i = 0;
-  while (i < kWordLimit && strings[i] != NULL) {
-    w_string_delref(strings[i++]);
-  }
-  free(strings);
-
-  w_ignore_destroy(&state);
+  XLOG(ERR) << label << ": took " << w_timeval_diff(start, end);
 }
 
-void bench_all_ignores(void) {
-  bench_list("all_ignores_tree", "baz/buck-out/gen/", w_ignore_check);
+TEST(Ignore, bench_all_ignores) {
+  bench_list("all_ignores_tree", "baz/buck-out/gen/");
 }
 
-void bench_no_ignores(void) {
-  bench_list("no_ignores_tree", "baz/some/path", w_ignore_check);
-}
-
-int main(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
-
-  plan_tests(17);
-  test_correctness();
-  bench_all_ignores();
-  bench_no_ignores();
-
-  return exit_status();
+TEST(Ignore, bench_no_ignores) {
+  bench_list("no_ignores_tree", "baz/some/path");
 }

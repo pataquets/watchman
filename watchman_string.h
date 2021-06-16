@@ -1,21 +1,29 @@
 /* Copyright 2012-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 
-#ifndef WATCHMAN_STRING_H
-#define WATCHMAN_STRING_H
+#pragma once
 
-#include <stdint.h>
+#include "watchman_system.h"
+
 #include <stdbool.h>
-#ifdef __cplusplus
+#include <stdint.h>
+#include <atomic>
+#include <cstring>
+#include <initializer_list>
 #include <memory>
+#ifdef _WIN32
+#include <string>
 #endif
-
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <fmt/format.h>
+#include <folly/Conv.h>
+#include <folly/Range.h>
+#include <folly/ScopeGuard.h>
+#include <stdexcept>
+#include <vector>
 
 struct watchman_string;
 typedef struct watchman_string w_string_t;
+class w_string_piece;
 
 typedef enum {
   W_STRING_BYTE,
@@ -24,119 +32,62 @@ typedef enum {
 } w_string_type_t;
 
 struct watchman_string {
-  long refcnt;
+  std::atomic<long> refcnt;
   uint32_t _hval;
   uint32_t len;
-  w_string_t *slice;
-  const char *buf;
-  w_string_type_t type:3;
-  unsigned hval_computed:1;
+  w_string_type_t type : 3;
+  unsigned hval_computed : 1;
 
-#ifdef __cplusplus
-  // our jansson fork depends on the C API, so hide this c++ism from it
-  watchman_string();
-  ~watchman_string();
-#endif
+  // This holds the character data.  This is a variable
+  // sized member and we have to specify at least 1 byte
+  // for the compiler to accept this.
+  // This must be the last element of this struct.
+  const char buf[1];
+
+  inline watchman_string()
+      : refcnt(0), len(0), type(W_STRING_BYTE), hval_computed(0), buf{0} {}
 };
 
-uint32_t w_string_compute_hval(w_string_t *str);
+uint32_t w_string_compute_hval(w_string_t* str);
 
-static inline uint32_t w_string_hval(w_string_t *str) {
+static inline uint32_t w_string_hval(w_string_t* str) {
   if (str->hval_computed) {
     return str->_hval;
   }
   return w_string_compute_hval(str);
 }
 
-void w_string_addref(w_string_t *str);
+w_string_piece w_string_canon_path(w_string_t* str);
+int w_string_compare(const w_string_t* a, const w_string_t* b);
+bool w_string_contains_cstr_len(
+    const w_string_t* str,
+    const char* needle,
+    uint32_t nlen);
 
-w_string_t *w_string_basename(w_string_t *str);
+bool w_string_equal(const w_string_t* a, const w_string_t* b);
+bool w_string_equal_cstring(const w_string_t* a, const char* b);
 
-w_string_t *w_string_canon_path(w_string_t *str);
-int w_string_compare(const w_string_t *a, const w_string_t *b);
-bool w_string_contains_cstr_len(w_string_t *str, const char *needle,
-                                uint32_t nlen);
+bool w_string_path_is_absolute(const w_string_t* str);
 
-void w_string_delref(w_string_t *str);
-w_string_t *w_string_dirname(w_string_t *str);
-char *w_string_dup_buf(const w_string_t *str);
-w_string_t *w_string_dup_lower(w_string_t *str);
+bool w_string_startswith(w_string_t* str, w_string_t* prefix);
+bool w_string_startswith_caseless(w_string_t* str, w_string_t* prefix);
 
-bool w_string_equal(const w_string_t *a, const w_string_t *b);
-bool w_string_equal_caseless(const w_string_t *a, const w_string_t *b);
-bool w_string_equal_cstring(const w_string_t *a, const char *b);
+bool w_string_is_known_unicode(w_string_t* str);
+bool w_string_is_null_terminated(w_string_t* str);
 
-void w_string_in_place_normalize_separators(w_string_t **str, char target_sep);
+uint32_t strlen_uint32(const char* str);
 
-w_string_t *w_string_make_printf(const char *format, ...);
+bool w_is_path_absolute_cstr(const char* path);
+bool w_is_path_absolute_cstr_len(const char* path, uint32_t len);
 
-/* Typed string creation functions. */
-w_string_t *w_string_new_typed(const char *str,
-    w_string_type_t type);
-w_string_t *w_string_new_len_typed(const char *str, uint32_t len,
-    w_string_type_t type);
-w_string_t *w_string_new_len_no_ref_typed(const char *str, uint32_t len,
-    w_string_type_t type);
-w_string_t *w_string_new_basename_typed(const char *path,
-    w_string_type_t type);
-w_string_t *w_string_new_lower_typed(const char *str,
-    w_string_type_t type);
-
-void w_string_new_len_typed_stack(w_string_t *into, const char *str,
-                                  uint32_t len, w_string_type_t type);
-
+inline bool is_slash(char c) {
+  return c == '/'
 #ifdef _WIN32
-w_string_t *w_string_new_wchar_typed(WCHAR *str, int len,
-    w_string_type_t type);
+      || c == '\\'
 #endif
-w_string_t *w_string_normalize_separators(w_string_t *str, char target_sep);
-
-w_string_t *w_string_path_cat(w_string_t *parent, w_string_t *rhs);
-w_string_t *w_string_path_cat_cstr(w_string_t *parent, const char *rhs);
-w_string_t *w_string_path_cat_cstr_len(w_string_t *parent, const char *rhs,
-                                       uint32_t rhs_len);
-bool w_string_path_is_absolute(const w_string_t *str);
-
-bool w_string_startswith(w_string_t *str, w_string_t *prefix);
-bool w_string_startswith_caseless(w_string_t *str, w_string_t *prefix);
-w_string_t *w_string_shell_escape(const w_string_t *str);
-w_string_t *w_string_slice(w_string_t *str, uint32_t start, uint32_t len);
-w_string_t *w_string_suffix(w_string_t *str);
-bool w_string_suffix_match(w_string_t *str, w_string_t *suffix);
-
-bool w_string_is_known_unicode(w_string_t *str);
-bool w_string_is_null_terminated(w_string_t *str);
-size_t w_string_strlen(w_string_t *str);
-
-uint32_t strlen_uint32(const char *str);
-uint32_t w_hash_bytes(const void *key, size_t length, uint32_t initval);
-
-uint32_t w_string_embedded_size(w_string_t *str);
-void w_string_embedded_copy(w_string_t *dest, w_string_t *src);
-
-struct watchman_dir;
-w_string_t *w_dir_copy_full_path(const struct watchman_dir *dir);
-w_string_t* w_dir_path_cat_cstr_len(
-    const struct watchman_dir* dir,
-    const char* extra,
-    uint32_t extra_len);
-w_string_t* w_dir_path_cat_cstr(
-    const struct watchman_dir* dir,
-    const char* extra);
-w_string_t* w_dir_path_cat_str(const struct watchman_dir* dir, w_string_t* str);
-
-bool w_is_path_absolute_cstr(const char *path);
-bool w_is_path_absolute_cstr_len(const char *path, uint32_t len);
-
-static inline bool is_slash(char c) {
-  return (c == '/') || (c == '\\');
+      ;
 }
 
-#ifdef __cplusplus
-}
-#endif
-
-#ifdef __cplusplus
 class w_string;
 
 /** Represents a view over some externally managed string storage.
@@ -155,9 +106,29 @@ class w_string_piece {
   /** Construct from a string-like object */
   template <
       typename String,
-      typename std::enable_if<std::is_class<String>::value>::type = 0>
+      typename std::enable_if<
+          std::is_class<String>::value &&
+              !std::is_same<String, w_string>::value,
+          int>::type = 0>
   inline /* implicit */ w_string_piece(const String& str)
       : s_(str.data()), e_(str.data() + str.size()) {}
+
+  /** Construct from w_string.  This is almost the same as
+   * the string like object constructor above, but we need a nullptr check
+   */
+  template <
+      typename String,
+      typename std::enable_if<std::is_same<String, w_string>::value, int>::
+          type = 0>
+  inline /* implicit */ w_string_piece(const String& str) {
+    if (!str) {
+      s_ = nullptr;
+      e_ = nullptr;
+    } else {
+      s_ = str.data();
+      e_ = str.data() + str.size();
+    }
+  }
 
   inline /* implicit */ w_string_piece(const char* cstr)
       : s_(cstr), e_(cstr + strlen(cstr)) {}
@@ -166,10 +137,15 @@ class w_string_piece {
       : s_(cstr), e_(cstr + len) {}
 
   w_string_piece(const w_string_piece& other) = default;
+  w_string_piece& operator=(const w_string_piece& other) = default;
   w_string_piece(w_string_piece&& other) noexcept;
 
   inline const char* data() const {
     return s_;
+  }
+
+  inline bool empty() const {
+    return e_ == s_;
   }
 
   inline size_t size() const {
@@ -180,18 +156,77 @@ class w_string_piece {
     return s_[i];
   }
 
+  /** move the start of the string by n characters, stripping off that prefix */
+  void advance(size_t n) {
+    if (n > size()) {
+      throw std::range_error("index out of range");
+    }
+    s_ += n;
+  }
+
   /** Return a copy of the string as a w_string */
   w_string asWString(w_string_type_t stringType = W_STRING_BYTE) const;
 
+  /** Return a lowercased copy of the string */
+  w_string asLowerCase(w_string_type_t stringType = W_STRING_BYTE) const;
+
+  /** Return a lowercased copy of the suffix */
+  w_string asLowerCaseSuffix(w_string_type_t stringType = W_STRING_BYTE) const;
+
+  /** Return a UTF-8-clean copy of the string */
+  w_string asUTF8Clean() const;
+
+  /** Returns true if the filename suffix of this string matches
+   * the provided suffix, which must be lower cased.
+   * This string piece lower cased and matched against suffix */
+  bool hasSuffix(w_string_piece suffix) const;
+
   bool pathIsAbsolute() const;
+  bool pathIsEqual(w_string_piece other) const;
   w_string_piece dirName() const;
   w_string_piece baseName() const;
+  w_string_piece suffix() const;
+
+  /** Split the string by delimiter and emit to the provided vector */
+  template <typename Vector>
+  void split(Vector& result, char delim) const {
+    const char* begin = s_;
+    const char* it = begin;
+    while (it != e_) {
+      if (*it == delim) {
+        result.emplace_back(begin, it - begin);
+        begin = ++it;
+        continue;
+      }
+      ++it;
+    }
+
+    if (begin != e_) {
+      result.emplace_back(begin, e_ - begin);
+    }
+  }
+
+  operator folly::StringPiece() const {
+    return folly::StringPiece(s_, e_);
+  }
 
   bool operator==(w_string_piece other) const;
+  bool operator!=(w_string_piece other) const;
+  bool operator<(w_string_piece other) const;
 
   bool startsWith(w_string_piece prefix) const;
   bool startsWithCaseInsensitive(w_string_piece prefix) const;
+
+  // Compute a hash value for this piece
+  uint32_t hashValue() const;
+
+#ifdef _WIN32
+  // Returns a wide character representation of the piece
+  std::wstring asWideUNC() const;
+#endif
 };
+
+bool w_string_equal_caseless(w_string_piece a, w_string_piece b);
 
 /** A smart pointer class for tracking w_string_t instances */
 class w_string {
@@ -203,11 +238,20 @@ class w_string {
   /** Make a new string from some bytes and a type */
   w_string(
       const char* buf,
-      uint32_t len,
+      size_t len,
       w_string_type_t stringType = W_STRING_BYTE);
   /* implicit */ w_string(
       const char* buf,
       w_string_type_t stringType = W_STRING_BYTE);
+
+#ifdef _WIN32
+  /** Convert a wide character path to utf-8 and return it as a w_string.
+   * This constructor is intended only for path names and not as a general
+   * WCHAR -> w_string constructor; it will always apply path mapping
+   * logic to the result and may mangle non-pathname strings if they
+   * are passed to it. */
+  w_string(const WCHAR* wpath, size_t len);
+#endif
 
   /** Initialize, taking a ref on w_string_t */
   /* implicit */ w_string(w_string_t* str, bool addRef = true);
@@ -227,13 +271,27 @@ class w_string {
   /** Stop tracking the underlying string object, returning the
    * reference to the caller.  The caller is responsible for
    * decrementing the refcount */
-  w_string_t *release();
+  w_string_t* release();
 
   operator w_string_t*() const {
     return str_;
   }
 
   operator w_string_piece() const {
+    return piece();
+  }
+
+  operator folly::StringPiece() const {
+    if (str_ == nullptr) {
+      return folly::StringPiece();
+    }
+    return folly::StringPiece(data(), size());
+  }
+
+  inline w_string_piece piece() const {
+    if (str_ == nullptr) {
+      return w_string_piece();
+    }
     return w_string_piece(data(), size());
   }
 
@@ -243,6 +301,7 @@ class w_string {
 
   bool operator==(const w_string& other) const;
   bool operator!=(const w_string& other) const;
+  bool operator<(const w_string& other) const;
 
   /** path concatenation
    * Pass in a list of w_string_pieces to join them all similarly to
@@ -250,25 +309,83 @@ class w_string {
   static w_string pathCat(std::initializer_list<w_string_piece> elems);
 
   /** Similar to asprintf, but returns a w_string */
-  static w_string printf(const char *format, ...);
+  static w_string vprintf(const char* format, va_list ap);
 
-  /** Return a possibly new version of this string that is null terminated */
-  w_string asNullTerminated() const;
+  /** build a w_string by concatenating the string formatted representation
+   * of each of the supplied arguments */
+  template <typename... Args>
+  static w_string build(Args&&... args) {
+    static const char format_str[] = "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}";
+    static_assert(
+        sizeof...(args) <= sizeof(format_str) / 2,
+        "too many args passed to w_string::build");
+    return w_string::format(
+        fmt::string_view(format_str, sizeof...(args) * 2),
+        std::forward<Args>(args)...);
+  }
 
-  /** Ensure that this instance is referencing a null terminated version
-   * of the current string */
-  void makeNullTerminated();
+  /** Construct a new string using the `fmt` formatting library.
+   * Syntax: https://fmt.dev/latest/syntax.html
+   */
+  template <typename... Args>
+  static w_string format(fmt::string_view format_str, Args&&... args) {
+    auto size = fmt::formatted_size(format_str, args...);
 
-  /** Returns a pointer to a null terminated c-string.
-   * If this instance doesn't point to a null terminated c-string, throws
-   * an exception that tells you to use asNullTerminated or makeNullTerminated
-   * first. */
-  const char* c_str() const;
+    w_string_t* s = (w_string_t*)(new char[sizeof(*s) + size + 1]);
+    new (s) watchman_string();
+
+    {
+      // in case format_to throws
+      SCOPE_FAIL {
+        delete[](char*) s;
+      };
+
+      s->refcnt = 1;
+      s->len = uint32_t(size);
+
+      auto mut_buf = const_cast<char*>(s->buf);
+      fmt::format_to(mut_buf, format_str, args...);
+
+      mut_buf[s->len] = 0;
+    }
+
+    return w_string(s, false);
+  }
+
+  /** Return a possibly new version of this string that has its separators
+   * normalized to unix slashes */
+  w_string normalizeSeparators(char targetSeparator = '/') const;
+
+  inline void ensureNotNull() const {
+    if (!str_) {
+      throw std::runtime_error("failed assertion w_string::ensureNotNull");
+    }
+  }
+
+  /** Returns a pointer to a null terminated c-string. */
+  const char* c_str() const {
+    return data();
+  }
   const char* data() const {
+    ensureNotNull();
     return str_->buf;
   }
+
+  bool empty() const {
+    if (str_) {
+      return str_->len == 0;
+    }
+    return true;
+  }
+
   size_t size() const {
+    ensureNotNull();
     return str_->len;
+  }
+
+  w_string_type_t type() const {
+    ensureNotNull();
+    return str_->type;
   }
 
   /** Returns the directory component of the string, assuming a path string */
@@ -276,10 +393,7 @@ class w_string {
   /** Returns the file name component of the string, assuming a path string */
   w_string baseName() const;
   /** Returns the filename suffix of a path string */
-  w_string suffix() const;
-
-  /** Returns a slice of this string */
-  w_string slice(uint32_t start, uint32_t len) const;
+  w_string asLowerCaseSuffix() const;
 
  private:
   w_string_t* str_{nullptr};
@@ -293,23 +407,96 @@ struct hash<w_string> {
     return w_string_hval(str);
   }
 };
+template <>
+struct hash<w_string_piece> {
+  std::size_t operator()(w_string_piece const& str) const {
+    return str.hashValue();
+  }
+};
+} // namespace std
+
+// Streaming operators for logging and printing
+std::ostream& operator<<(std::ostream& stream, const w_string& a);
+std::ostream& operator<<(std::ostream& stream, const w_string_piece& a);
+
+// Allow formatting w_string and w_string_piece
+namespace fmt {
+template <>
+struct formatter<w_string> {
+  template <typename ParseContext>
+  constexpr auto parse(ParseContext& ctx) {
+    return ctx.begin();
+  }
+
+  template <typename FormatContext>
+  auto format(const w_string& s, FormatContext& ctx) {
+    return format_to(ctx.out(), "{}", folly::StringPiece(s));
+  }
+};
+
+template <>
+struct formatter<w_string_piece> {
+  template <typename ParseContext>
+  constexpr auto parse(ParseContext& ctx) {
+    return ctx.begin();
+  }
+
+  template <typename FormatContext>
+  auto format(const w_string_piece& s, FormatContext& ctx) {
+    return format_to(ctx.out(), "{}", folly::StringPiece(s));
+  }
+};
+} // namespace fmt
+
+/**
+ * Write as many characters from the beginning of `piece` into `array` as will
+ * fit. If the string is too long, the truncated characters are replaced with
+ * "...".
+ *
+ * This function primarily exists for fixed-size, in-memory logging.
+ *
+ * The resulting array may not be null-terminated. Use strnlen to compute its
+ * length.
+ */
+template <size_t N>
+void storeTruncatedHead(char (&array)[N], w_string_piece piece) {
+  if (piece.size() > N) {
+    memcpy(array, piece.data(), N - 3);
+    array[N - 3] = '.';
+    array[N - 2] = '.';
+    array[N - 1] = '.';
+  } else {
+    memcpy(array, piece.data(), piece.size());
+    if (piece.size() < N) {
+      array[piece.size()] = 0;
+    }
+  }
 }
 
-/** helper for automatically releasing malloc'd memory.
+/**
+ * Write as many characters from the end of `piece` into `array` as will
+ * fit. If the string is too long, the truncated characters are replaced with
+ * "...".
  *
- * auto s = autofree(strdup("something"));
- * printf("%s\n", s.get());
+ * This function primarily exists for fixed-size, in-memory logging.
  *
- * The implementation returns a unique_ptr that will free()
- * the memory when it falls out of scope. */
-template <typename T>
-std::unique_ptr<T, decltype(free) *> autofree(T* mem) {
-  return std::unique_ptr<T, decltype(free)*>{mem, free};
+ * The resulting array may not be null-terminated. Use strnlen to compute its
+ * length.
+ */
+template <size_t N>
+void storeTruncatedTail(char (&array)[N], w_string_piece piece) {
+  if (piece.size() > N) {
+    array[0] = '.';
+    array[1] = '.';
+    array[2] = '.';
+    memcpy(array + 3, piece.data() + piece.size() - (N - 3), N - 3);
+  } else {
+    memcpy(array, piece.data(), piece.size());
+    if (piece.size() < N) {
+      array[piece.size()] = 0;
+    }
+  }
 }
-
-#endif
-
-#endif
 
 /* vim:ts=2:sw=2:et:
  */

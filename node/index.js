@@ -158,15 +158,15 @@ Client.prototype.connect = function() {
       return;
     }
     spawnFailed = true;
-    if (error.errno === 'EACCES') {
+    if (error.code === 'EACCES' || error.errno === 'EACCES') {
       error.message = 'The Watchman CLI is installed but cannot ' +
                       'be spawned because of a permission problem';
-    } else if (error.errno === 'ENOENT') {
+    } else if (error.code === 'ENOENT' || error.errno === 'ENOENT') {
       error.message = 'Watchman was not found in PATH.  See ' +
           'https://facebook.github.io/watchman/docs/install.html ' +
           'for installation instructions';
     }
-    console.log('Watchman: ', error.message);
+    console.error('Watchman: ', error.message);
     self.emit('error', error);
   }
 
@@ -187,7 +187,7 @@ Client.prototype.connect = function() {
   proc.stderr.on('data', function(data) {
     data = data.toString('utf8');
     stderr.push(data);
-    console.log(data);
+    console.error(data);
   });
   proc.on('error', function(error) {
     spawnError(error);

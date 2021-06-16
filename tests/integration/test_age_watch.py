@@ -2,99 +2,56 @@
 # Copyright 2012-present Facebook, Inc.
 # Licensed under the Apache License, Version 2.0
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 # no unicode literals
+from __future__ import absolute_import, division, print_function
 
-import WatchmanTestCase
-import tempfile
+import json
 import os
 import os.path
 import time
-import json
+
+import WatchmanTestCase
 
 
 @WatchmanTestCase.expand_matrix
 class TestAgeOutWatch(WatchmanTestCase.WatchmanTestCase):
-
     def makeRootAndConfig(self):
         root = self.mkdtemp()
-        with open(os.path.join(root, '.watchmanconfig'), 'w') as f:
-            f.write(json.dumps({
-                'idle_reap_age_seconds': 1
-            }))
+        with open(os.path.join(root, ".watchmanconfig"), "w") as f:
+            f.write(json.dumps({"idle_reap_age_seconds": 3}))
         return root
-
-    def listContains(self, superset, subset):
-        superset = self.normWatchmanFileList(superset)
-        for x in self.normFileList(subset):
-            if x not in superset:
-                return False
-        return True
-
-    def listNotContains(self, superset, subset):
-        superset = self.normWatchmanFileList(superset)
-        for x in self.normFileList(subset):
-            if x in superset:
-                return False
-        return True
-
-    def assertListNotContains(self, superset, subset):
-        if self.listNotContains(superset, subset):
-            return
-        self.assertTrue(
-            False, "superset: %s should not contain any of the elements of %s" % (superset, subset))
 
     def test_watchReap(self):
         root = self.makeRootAndConfig()
-        self.watchmanCommand('watch', root)
+        self.watchmanCommand("watch", root)
 
         # make sure that we don't reap when there are registered triggers
-        self.watchmanCommand('trigger', root, {
-            'name': 't',
-            'command': ['true']})
+        self.watchmanCommand("trigger", root, {"name": "t", "command": ["true"]})
 
         # wait long enough for the reap to be considered
-        time.sleep(2)
+        time.sleep(6)
 
-        watch_list = self.watchmanCommand('watch-list')
-        self.assertTrue(self.listContains(watch_list['roots'], [root]))
+        self.assertTrue(self.rootIsWatched(root))
 
-        self.watchmanCommand('trigger-del', root, 't')
+        self.watchmanCommand("trigger-del", root, "t")
 
         # Make sure that we don't reap while we hold a subscription
-        res = self.watchmanCommand('subscribe', root, 's', {
-            'fields': ['name']})
+        self.watchmanCommand("subscribe", root, "s", {"fields": ["name"]})
 
-        if self.transport == 'cli':
-            # subscription won't stick in cli mode
-            expected = []
-        else:
-            expected = self.normFileList([root])
+        # subscription won't stick in cli mode
+        if self.transport != "cli":
+            self.assertWaitFor(lambda: self.rootIsWatched(root))
 
-        self.waitFor(lambda: self.listContains(
-            self.watchmanCommand('watch-list')['roots'], expected))
-
-        watch_list = self.watchmanCommand('watch-list')
-        self.assertTrue(self.listContains(watch_list['roots'], expected))
-
-        if self.transport != 'cli':
             # let's verify that we can safely reap two roots at once without
             # causing a deadlock
             second = self.makeRootAndConfig()
-            self.watchmanCommand('watch', second)
-            self.assertFileList(second, ['.watchmanconfig'])
+            self.watchmanCommand("watch", second)
+            self.assertFileList(second, [".watchmanconfig"])
 
             # and unsubscribe from root and allow it to be reaped
-            unsub = self.watchmanCommand('unsubscribe', root, 's')
-            self.assertTrue(unsub['deleted'], 'deleted subscription %s' % unsub)
-            expected.append(self.normPath(second))
-
-        # and now we should be ready to reap
-        self.waitFor(lambda: self.listNotContains(
-            self.watchmanCommand('watch-list')['roots'], expected))
-
-        self.assertListNotContains(
-            self.watchmanCommand('watch-list')['roots'], expected)
-
+            unsub = self.watchmanCommand("unsubscribe", root, "s")
+            self.assertTrue(unsub["deleted"], "deleted subscription %s" % unsub)
+            # and now we should be ready to reap
+            self.assertWaitFor(
+                lambda: not self.rootIsWatched(root) and not self.rootIsWatched(second)
+            )

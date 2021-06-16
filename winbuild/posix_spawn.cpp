@@ -1,69 +1,67 @@
 /* Copyright 2014-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 #include "watchman.h"
+#include <folly/String.h>
+#include <folly/Synchronized.h>
+
+using namespace watchman;
 
 // Maps pid => process handle
 // This is so that we can wait/poll/query the termination status
-static w_ht_t *child_procs = NULL;
-static pthread_mutex_t child_proc_lock = PTHREAD_MUTEX_INITIALIZER;
+static folly::Synchronized<std::unordered_map<DWORD, HANDLE>> child_procs;
 
-BOOL w_wait_for_any_child(DWORD timeoutms, DWORD *pid) {
-  HANDLE handles[MAXIMUM_WAIT_OBJECTS];
-  DWORD pids[MAXIMUM_WAIT_OBJECTS];
-  int i = 0;
-  w_ht_iter_t iter;
-  DWORD res;
+pid_t waitpid(pid_t pid, int* status, int options) {
+  HANDLE h;
 
-  *pid = 0;
-
-  pthread_mutex_lock(&child_proc_lock);
-  if (child_procs && w_ht_first(child_procs, &iter)) do {
-    HANDLE proc = w_ht_val_ptr(iter.value);
-    pids[i] = (DWORD)iter.key;
-    handles[i++] = proc;
-  } while (w_ht_next(child_procs, &iter));
-  pthread_mutex_unlock(&child_proc_lock);
-
-  if (i == 0) {
-    return false;
+  {
+    auto rlock = child_procs.rlock();
+    auto it = rlock->find(pid);
+    if (it == rlock->end()) {
+      errno = ESRCH;
+      return -1;
+    }
+    h = it->second;
   }
 
-  w_log(W_LOG_DBG, "w_wait_for_any_child: waiting for %d handles\n", i);
-  res = WaitForMultipleObjectsEx(i, handles, false, timeoutms, true);
-  if (res == WAIT_FAILED) {
-    errno = map_win32_err(GetLastError());
-    return false;
+  auto res = WaitForSingleObject(h, options == WNOHANG ? 0 : INFINITE);
+
+  switch (res) {
+    case WAIT_OBJECT_0: {
+      DWORD exitCode = 0;
+      GetExitCodeProcess(h, &exitCode);
+      *status = int(exitCode);
+      child_procs.wlock()->erase(pid);
+      return pid;
+    }
+    case WAIT_ABANDONED_0:
+      *status = 0;
+      child_procs.wlock()->erase(pid);
+      return pid;
+    case WAIT_TIMEOUT:
+      return 0;
+    default:
+      errno = EINVAL;
+      return -1;
   }
-
-  if (res < WAIT_OBJECT_0 + i) {
-    i = res - WAIT_OBJECT_0;
-  } else if (res >= WAIT_ABANDONED_0 && res < WAIT_ABANDONED_0 + i) {
-    i = res - WAIT_ABANDONED_0;
-  } else {
-    return false;
-  }
-
-  pthread_mutex_lock(&child_proc_lock);
-  w_ht_del(child_procs, pids[i]);
-  pthread_mutex_unlock(&child_proc_lock);
-
-  CloseHandle(handles[i]);
-  *pid = pids[i];
-  return true;
 }
 
-int posix_spawnattr_init(posix_spawnattr_t *attrp) {
-  memset(attrp, 0, sizeof(*attrp));
+int posix_spawnattr_init(posix_spawnattr_t* attrp) {
+  *attrp = posix_spawnattr_t();
   return 0;
 }
 
-int posix_spawnattr_setflags(posix_spawnattr_t *attrp, int flags) {
+int posix_spawnattr_setflags(posix_spawnattr_t* attrp, short flags) {
   attrp->flags = flags;
   return 0;
 }
 
-int posix_spawnattr_setcwd_np(posix_spawnattr_t *attrp, const char *path) {
-  char *path_dup = NULL;
+int posix_spawnattr_getflags(posix_spawnattr_t* attrp, short* flags) {
+  *flags = attrp->flags;
+  return 0;
+}
+
+int posix_spawnattr_setcwd_np(posix_spawnattr_t* attrp, const char* path) {
+  char* path_dup = NULL;
 
   if (path) {
     path_dup = strdup(path);
@@ -77,20 +75,22 @@ int posix_spawnattr_setcwd_np(posix_spawnattr_t *attrp, const char *path) {
   return 0;
 }
 
-int posix_spawnattr_destroy(posix_spawnattr_t *attrp) {
+int posix_spawnattr_destroy(posix_spawnattr_t* attrp) {
   free(attrp->working_dir);
   return 0;
 }
 
-int posix_spawn_file_actions_init(posix_spawn_file_actions_t *actions) {
-  memset(actions, 0, sizeof(*actions));
+int posix_spawn_file_actions_init(posix_spawn_file_actions_t* actions) {
+  *actions = posix_spawn_file_actions_t();
   return 0;
 }
 
-int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t *actions,
-    int fd, int target_fd) {
+int posix_spawn_file_actions_adddup2(
+    posix_spawn_file_actions_t* actions,
+    int fd,
+    int target_fd) {
   struct _posix_spawn_file_action *acts, *act;
-  acts = (_posix_spawn_file_action *)realloc(
+  acts = (_posix_spawn_file_action*)realloc(
       actions->acts, (actions->nacts + 1) * sizeof(*acts));
   if (!acts) {
     return ENOMEM;
@@ -105,10 +105,11 @@ int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t *actions,
 }
 
 int posix_spawn_file_actions_adddup2_handle_np(
-    posix_spawn_file_actions_t *actions,
-    HANDLE handle, int target_fd) {
+    posix_spawn_file_actions_t* actions,
+    intptr_t handle,
+    int target_fd) {
   struct _posix_spawn_file_action *acts, *act;
-  acts = (_posix_spawn_file_action *)realloc(
+  acts = (_posix_spawn_file_action*)realloc(
       actions->acts, (actions->nacts + 1) * sizeof(*acts));
   if (!acts) {
     return ENOMEM;
@@ -122,14 +123,18 @@ int posix_spawn_file_actions_adddup2_handle_np(
   return 0;
 }
 
-int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *actions,
-    int target_fd, const char *name, int flags, int mode) {
+int posix_spawn_file_actions_addopen(
+    posix_spawn_file_actions_t* actions,
+    int target_fd,
+    const char* name,
+    int flags,
+    int mode) {
   struct _posix_spawn_file_action *acts, *act;
-  char *name_dup = strdup(name);
+  char* name_dup = strdup(name);
   if (!name_dup) {
     return ENOMEM;
   }
-  acts = (_posix_spawn_file_action *)realloc(
+  acts = (_posix_spawn_file_action*)realloc(
       actions->acts, (actions->nacts + 1) * sizeof(*acts));
   if (!acts) {
     free(name_dup);
@@ -147,7 +152,7 @@ int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *actions,
   return 0;
 }
 
-int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *actions) {
+int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t* actions) {
   int i;
   for (i = 0; i < actions->nacts; i++) {
     if (actions->acts[i].action != _posix_spawn_file_action::open_file) {
@@ -160,7 +165,7 @@ int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *actions) {
 }
 
 #define CMD_EXE_PREFIX "cmd.exe /c \""
-static char *build_command_line(char *const argv[]) {
+static char* build_command_line(char* const argv[]) {
   int argc = 0, i = 0;
   size_t size = 0;
   char *cmdbuf = NULL, *cur = NULL;
@@ -184,7 +189,7 @@ static char *build_command_line(char *const argv[]) {
   cur = cmdbuf + strlen(CMD_EXE_PREFIX);
   for (i = 0; i < argc; i++) {
     int j;
-    char *arg = argv[i];
+    char* arg = argv[i];
 
     // Space separated
     if (i > 0) {
@@ -216,11 +221,11 @@ static char *build_command_line(char *const argv[]) {
   return cmdbuf;
 }
 
-static char *make_env_block(char *const envp[]) {
+static char* make_env_block(char* const envp[]) {
   int i;
   size_t total_len = 1; /* for final NUL */
-  char *block = NULL;
-  char *target = NULL;
+  char* block = NULL;
+  char* target = NULL;
 
   for (i = 0; envp[i]; i++) {
     total_len += strlen(envp[i]) + 1;
@@ -248,16 +253,18 @@ static char *make_env_block(char *const envp[]) {
 
 static int posix_spawn_common(
     bool search_path,
-    pid_t *pid, const char *path,
-    const posix_spawn_file_actions_t *file_actions,
-    const posix_spawnattr_t *attrp,
-    char *const argv[], char *const envp[]) {
-  STARTUPINFOEX sinfo;
-  SECURITY_ATTRIBUTES sec;
-  PROCESS_INFORMATION pinfo;
-  char *cmdbuf;
-  char *env_block;
-  DWORD create_flags = CREATE_NO_WINDOW|EXTENDED_STARTUPINFO_PRESENT;
+    pid_t* pid,
+    const char* path,
+    const posix_spawn_file_actions_t* file_actions,
+    const posix_spawnattr_t* attrp,
+    char* const argv[],
+    char* const envp[]) {
+  auto sinfo = STARTUPINFOEX();
+  auto sec = SECURITY_ATTRIBUTES();
+  auto pinfo = PROCESS_INFORMATION();
+  char* cmdbuf;
+  char* env_block;
+  DWORD create_flags = CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
   int ret;
   int i;
   HANDLE inherited_handles[3] = {0, 0, 0};
@@ -273,24 +280,20 @@ static int posix_spawn_common(
     return ENOMEM;
   }
 
-  memset(&sinfo, 0, sizeof(sinfo));
   sinfo.StartupInfo.cb = sizeof(sinfo);
-  sinfo.StartupInfo.dwFlags = STARTF_USESTDHANDLES|STARTF_USESHOWWINDOW;
+  sinfo.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
   sinfo.StartupInfo.wShowWindow = SW_HIDE;
 
-  memset(&sec, 0, sizeof(sec));
   sec.nLength = sizeof(sec);
   sec.bInheritHandle = TRUE;
-
-  memset(&pinfo, 0, sizeof(pinfo));
 
   if (attrp->flags & POSIX_SPAWN_SETPGROUP) {
     create_flags |= CREATE_NEW_PROCESS_GROUP;
   }
 
   for (i = 0; i < file_actions->nacts; i++) {
-    struct _posix_spawn_file_action *act = &file_actions->acts[i];
-    HANDLE *target = NULL;
+    struct _posix_spawn_file_action* act = &file_actions->acts[i];
+    HANDLE* target = NULL;
 
     switch (act->target_fd) {
       case 0:
@@ -305,7 +308,7 @@ static int posix_spawn_common(
     }
 
     if (!target) {
-      w_log(W_LOG_ERR, "posix_spawn: can't target fd outside range [0-2]\n");
+      logf(ERR, "posix_spawn: can't target fd outside range [0-2]\n");
       ret = ENOSYS;
       goto done;
     }
@@ -335,35 +338,45 @@ static int posix_spawn_common(
         if (!src) {
           src = (HANDLE)_get_osfhandle(act->u.source_fd);
         }
-        act->u.dup_local_handle = src;
+        act->u.dup_local_handle = intptr_t(src);
       }
 
-      if (!DuplicateHandle(GetCurrentProcess(), act->u.dup_local_handle,
-            GetCurrentProcess(), target, 0,
-            TRUE, DUPLICATE_SAME_ACCESS)) {
+      if (!DuplicateHandle(
+              GetCurrentProcess(),
+              (HANDLE)act->u.dup_local_handle,
+              GetCurrentProcess(),
+              target,
+              0,
+              TRUE,
+              DUPLICATE_SAME_ACCESS)) {
         err = GetLastError();
-        w_log(W_LOG_ERR, "posix_spawn: failed to duplicate handle: %s\n",
+        logf(
+            ERR,
+            "posix_spawn: failed to duplicate handle: {}\n",
             win32_strerror(err));
         ret = map_win32_err(err);
         goto done;
       }
     } else {
       // Process an open(2) action
-      HANDLE h;
 
-      h = w_handle_open(act->u.open_info.name,
-              act->u.open_info.flags & ~O_CLOEXEC);
-      if (h == INVALID_HANDLE_VALUE) {
+      auto h = w_handle_open(
+          act->u.open_info.name, act->u.open_info.flags & ~O_CLOEXEC);
+      if (!h) {
         ret = errno;
-        w_log(W_LOG_ERR, "posix_spawn: failed to open %s:\n",
-            act->u.open_info.name);
+        logf(
+            ERR,
+            "posix_spawn: failed to open {} into target fd {}: {}\n",
+            act->u.open_info.name,
+            act->target_fd,
+            folly::errnoStr(ret));
         goto done;
       }
 
       if (*target) {
         CloseHandle(*target);
       }
-      *target = h;
+      *target = (HANDLE)h.release();
     }
   }
 
@@ -389,16 +402,31 @@ static int posix_spawn_common(
     InitializeProcThreadAttributeList(NULL, 1, 0, &size);
     sinfo.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(size);
     InitializeProcThreadAttributeList(sinfo.lpAttributeList, 1, 0, &size);
-    UpdateProcThreadAttribute(sinfo.lpAttributeList, 0,
+    UpdateProcThreadAttribute(
+        sinfo.lpAttributeList,
+        0,
         PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        inherited_handles, 3 * sizeof(HANDLE),
-        NULL, NULL);
+        inherited_handles,
+        3 * sizeof(HANDLE),
+        NULL,
+        NULL);
   }
 
-  if (!CreateProcess(search_path ? NULL : path,
-        cmdbuf, &sec, &sec, TRUE, create_flags, env_block,
-        attrp->working_dir, &sinfo.StartupInfo, &pinfo)) {
-    w_log(W_LOG_ERR, "CreateProcess: `%s`: (cwd=%s) %s\n", cmdbuf,
+  if (!CreateProcess(
+          search_path ? NULL : path,
+          cmdbuf,
+          &sec,
+          &sec,
+          TRUE,
+          create_flags,
+          env_block,
+          attrp->working_dir,
+          &sinfo.StartupInfo,
+          &pinfo)) {
+    logf(
+        ERR,
+        "CreateProcess: `{}`: (cwd={}) {}\n",
+        cmdbuf,
         attrp->working_dir ? attrp->working_dir : "<process cwd>",
         win32_strerror(GetLastError()));
     ret = EACCES;
@@ -406,12 +434,7 @@ static int posix_spawn_common(
     *pid = (pid_t)pinfo.dwProcessId;
 
     // Record the pid -> handle mapping for later wait/reap
-    pthread_mutex_lock(&child_proc_lock);
-    if (!child_procs) {
-      child_procs = w_ht_new(2, NULL);
-    }
-    w_ht_set(child_procs, pinfo.dwProcessId, w_ht_ptr_val(pinfo.hProcess));
-    pthread_mutex_unlock(&child_proc_lock);
+    child_procs.wlock()->emplace(pinfo.dwProcessId, pinfo.hProcess);
 
     CloseHandle(pinfo.hThread);
     ret = 0;
@@ -437,18 +460,22 @@ done:
   return ret;
 }
 
-int posix_spawn(pid_t *pid, const char *path,
-    const posix_spawn_file_actions_t *file_actions,
-    const posix_spawnattr_t *attrp,
-    char *const argv[], char *const envp[]) {
-
+int posix_spawn(
+    pid_t* pid,
+    const char* path,
+    const posix_spawn_file_actions_t* file_actions,
+    const posix_spawnattr_t* attrp,
+    char* const argv[],
+    char* const envp[]) {
   return posix_spawn_common(false, pid, path, file_actions, attrp, argv, envp);
 }
 
-int posix_spawnp(pid_t *pid, const char *file,
-    const posix_spawn_file_actions_t *file_actions,
-    const posix_spawnattr_t *attrp,
-    char *const argv[], char *const envp[]) {
-
+int posix_spawnp(
+    pid_t* pid,
+    const char* file,
+    const posix_spawn_file_actions_t* file_actions,
+    const posix_spawnattr_t* attrp,
+    char* const argv[],
+    char* const envp[]) {
   return posix_spawn_common(true, pid, file, file_actions, attrp, argv, envp);
 }

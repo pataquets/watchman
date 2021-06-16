@@ -1,10 +1,17 @@
 /* Copyright 2016-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 
+#include "watchman_system.h"
 #include "watchman.h"
+#include <folly/ScopeGuard.h>
 #include <memory>
+#include "FileSystem.h"
+#include "LogConfig.h"
+#include "watchman_error_category.h"
 
-#ifndef _WIN32
+using watchman::readSymbolicLink;
+using watchman::realPath;
+
 // Given a target of the form "absolute_path/filename", return
 // realpath(absolute_path) + filename, where realpath(absolute_path) resolves
 // all the symlinks in absolute_path.
@@ -14,15 +21,15 @@ static w_string get_normalized_target(const w_string& target) {
   w_assert(
       w_string_path_is_absolute(target),
       "get_normalized_target: path %s is not absolute\n",
-      target.asNullTerminated().c_str());
+      target.c_str());
 
-  auto dir_name = target.dirName().asNullTerminated();
-  auto dir_name_real = autofree(w_realpath(dir_name.c_str()));
+  auto dir_name = target.dirName();
+  auto dir_name_real = realPath(dir_name.c_str());
   err = errno;
 
   if (dir_name_real) {
     auto file_name = target.baseName();
-    return w_string::pathCat({dir_name_real.get(), file_name});
+    return w_string::pathCat({dir_name_real, file_name});
   }
 
   errno = err;
@@ -31,50 +38,49 @@ static w_string get_normalized_target(const w_string& target) {
 
 // Requires target to be an absolute path
 static void watch_symlink_target(const w_string& target, json_t* root_files) {
-
   w_assert(
       w_string_path_is_absolute(target),
       "watch_symlink_target: path %s is not absolute\n",
       target.c_str());
 
-  auto normalized_target = get_normalized_target(target);
-  if (!normalized_target) {
-    w_log(
-        W_LOG_ERR,
-        "watch_symlink_target: "
-        "unable to get normalized version of target `%s`; "
-        "realpath errno %d %s\n",
-        target.asNullTerminated().c_str(),
-        errno,
-        strerror(errno));
+  w_string normalized_target;
+  try {
+    normalized_target = get_normalized_target(target);
+  } catch (const std::system_error& exc) {
+    watchman::log(
+        watchman::ERR,
+        "watch_symlink_target: unable to get normalized version of target `",
+        target,
+        "`; realpath ",
+        exc.what(),
+        "\n");
     return;
   }
 
-  char *relpath = nullptr;
-  auto watched_root =
-      autofree(w_find_enclosing_root(normalized_target.c_str(), &relpath));
-  if (!watched_root) {
-    char *errmsg = NULL;
-    auto resolved = autofree(w_string_dup_buf(normalized_target));
-    if (!find_project_root(root_files, resolved.get(), &relpath)) {
-      w_log(
-          W_LOG_ERR,
-          "watch_symlink_target: No watchable root for %s\n",
-          resolved.get());
-    } else {
-      struct unlocked_watchman_root unlocked;
-      bool success = w_root_resolve(resolved.get(), true, &errmsg, &unlocked);
+  w_string_piece relpath;
+  w_string_piece watched_root;
+  bool enclosing = findEnclosingRoot(normalized_target, watched_root, relpath);
+  if (!enclosing) {
+    w_string_piece resolved(normalized_target);
 
-      if (!success) {
-        w_log(
-            W_LOG_ERR,
-            "watch_symlink_target: unable to watch %s: %s\n",
-            resolved.get(),
-            errmsg);
-      } else {
-        w_root_delref(&unlocked);
+    if (!find_project_root(root_files, resolved, relpath)) {
+      watchman::log(
+          watchman::ERR,
+          "watch_symlink_target: No watchable root for ",
+          resolved,
+          "\n");
+    } else {
+      try {
+        auto root = w_root_resolve(resolved.asWString().c_str(), true);
+      } catch (const std::exception& exc) {
+        watchman::log(
+            watchman::ERR,
+            "watch_symlink_target: unable to watch ",
+            resolved,
+            ": ",
+            exc.what(),
+            "\n");
       }
-      free(errmsg);
     }
   }
 }
@@ -83,55 +89,26 @@ static void watch_symlink_target(const w_string& target, json_t* root_files) {
  * Since the target of a symbolic link might contain several components that
  * are themselves symlinks, this function gets called recursively on all the
  * components of path. */
-static void watch_symlinks(const w_string& inputPath, json_t* root_files) {
-  char link_target_path[WATCHMAN_NAME_MAX];
-  ssize_t tlen = 0;
+static void watch_symlinks(const w_string& path, json_t* root_files) {
+  w_string_piece pathPiece(path);
+  auto parentPiece = pathPiece.dirName();
 
-  // We do not currently support symlinks on Windows, so comparing path to "/"
-  // is ok
-  if (!inputPath || w_string_strlen(inputPath) == 0 ||
-      w_string_equal_cstring(inputPath, "/")) {
+  if (parentPiece == pathPiece) {
+    // We've reached the root of the VFS; we're either "/" on unix,
+    // or something like "C:\" on windows
+    return;
+  }
+  if (!pathPiece.pathIsAbsolute()) {
     return;
   }
 
-  // ensure that buffer is null-terminated
-  auto path = inputPath.asNullTerminated();
-
-  w_assert(
-      w_string_path_is_absolute(path),
-      "watch_symlinks: path %s is not absolute\n",
-      path.c_str());
-
   auto dir_name = path.dirName();
   auto file_name = path.baseName();
-  tlen = readlink(path.c_str(), link_target_path, sizeof(link_target_path));
 
-  if (tlen >= (ssize_t)sizeof(link_target_path)) {
-    w_log(
-        W_LOG_ERR,
-        "watch_symlinks: readlink(%s), symlink target is too "
-        "long: %d chars >= %d chars\n",
-        path.c_str(),
-        (int)tlen,
-        (int)sizeof(link_target_path));
-  } else if (tlen < 0) {
-    if (errno == EINVAL) {
-      // The final component of path is not a symbolic link, but other
-      // components in the path might be symbolic links
-      watch_symlinks(dir_name, root_files);
-    } else {
-      w_log(
-          W_LOG_ERR,
-          "watch_symlinks: readlink(%s) errno=%d %s tlen=%d\n",
-          path.c_str(),
-          errno,
-          strerror(errno),
-          (int)tlen);
-    }
-  } else {
-    w_string target(link_target_path, tlen, W_STRING_BYTE);
+  try {
+    auto target = readSymbolicLink(path.c_str());
 
-    if (w_string_path_is_absolute(target)) {
+    if (w_string_piece(target).pathIsAbsolute()) {
       watch_symlink_target(target, root_files);
       watch_symlinks(target, root_files);
       watch_symlinks(dir_name, root_files);
@@ -143,48 +120,51 @@ static void watch_symlinks(const w_string& inputPath, json_t* root_files) {
       // No need to watch_symlinks(dir_name), since
       // watch_symlinks(absolute_target) will eventually have the same effect
     }
+  } catch (const std::system_error& exc) {
+    if (exc.code() == watchman::error_code::not_a_symlink) {
+      // The final component of path is not a symbolic link, but other
+      // components in the path might be symbolic links
+      watch_symlinks(dir_name, root_files);
+    } else {
+      watchman::log(
+          watchman::ERR,
+          "watch_symlinks: readSymbolicLink(",
+          path,
+          ") ",
+          exc.what(),
+          "\n");
+    }
   }
 }
-#endif  // Symlink-related function definitions excluded for _WIN32
 
 /** Process the list of observed changed symlinks and arrange to establish
  * watches for their new targets */
-void process_pending_symlink_targets(struct unlocked_watchman_root *unlocked) {
-#ifndef _WIN32
-  struct watchman_pending_fs *p, *pending;
-  json_t *root_files;
+void watchman_root::processPendingSymlinkTargets() {
   bool enforcing;
 
-  pending = unlocked->root->inner.pending_symlink_targets.pending;
-  if (!pending) {
+  auto pendingLock = inner.pending_symlink_targets.lock();
+
+  if (pendingLock->empty()) {
     return;
   }
 
-  root_files = cfg_compute_root_files(&enforcing);
+  auto root_files = cfg_compute_root_files(&enforcing);
   if (!root_files) {
-    w_log(W_LOG_ERR,
-          "watch_symlink_target: error computing root_files configuration "
-          "value, consult your log file at %s for more details\n", log_name);
+    watchman::log(
+        watchman::ERR,
+        "watch_symlink_target: error computing root_files configuration "
+        "value, consult your log file at ",
+        log_name,
+        " for more details\n");
     return;
   }
 
-  // It is safe to work with unlocked->root->pending_symlink_targets because
-  // this collection is only ever mutated from the IO thread
-  unlocked->root->inner.pending_symlink_targets.pending = NULL;
-  w_pending_coll_drain(&unlocked->root->inner.pending_symlink_targets);
-  while (pending) {
-    p = pending;
-    pending = p->next;
+  auto p = pendingLock->stealItems();
+  while (p) {
     watch_symlinks(p->path, root_files);
-    w_pending_fs_free(p);
+    p = std::move(p->next);
   }
-
-  json_decref(root_files);
-#else
-  unused_parameter(unlocked);
-#endif
 }
-
 
 /* vim:ts=2:sw=2:et:
  */

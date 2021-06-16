@@ -1,9 +1,10 @@
 ---
-id: capabilities
+pageid: capabilities
 title: Capabilities
 layout: docs
 category: Compatibility
 permalink: docs/capabilities.html
+redirect_from: docs/capabilities/
 ---
 
 *Since 3.8*
@@ -48,3 +49,5 @@ Capability Name | Since version | Description
 ----------------|---------------|------------
 `relative_root` | 3.3           | `relative_root` query option
 `wildmatch`     | 3.7           | [Expanded `match` term with recursive globs](/watchman/docs/expr/match.html#wildmatch)
+`suffix-set`    | 5.0           | [Expanded `suffix` to support set of suffixes](/watchman/docs/expr/suffix.html#suffixset)
+

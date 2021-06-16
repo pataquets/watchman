@@ -1,9 +1,10 @@
 ---
-id: cmd.subscribe
+pageid: cmd.subscribe
 title: subscribe
 layout: docs
 section: Commands
 permalink: docs/cmd/subscribe.html
+redirect_from: docs/cmd/subscribe/
 ---
 
 *Since 1.6*
@@ -200,3 +201,10 @@ described above, but when a state is vacated, the pending notification stream
 is fast-forwarded to the clock of the `state-leave` command, effectively
 suppressing any notifications that were generated between the `state-enter`
 and the `state-leave` commands.
+
+## Source Control Aware Subscriptions
+
+*Since 4.9*
+
+[Read more about these here](/watchman/docs/scm-query.html)
+

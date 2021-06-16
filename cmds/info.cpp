@@ -3,30 +3,34 @@
 
 #include "watchman.h"
 
-static bool query_caps(json_t *response, json_t *result,
-    json_t *arr, bool required) {
+using namespace watchman;
+
+static bool query_caps(
+    json_ref& response,
+    json_ref& result,
+    const json_ref& arr,
+    bool required) {
   size_t i;
   bool have_all = true;
 
   for (i = 0; i < json_array_size(arr); i++) {
-    json_t *ele = json_array_get(arr, i);
+    const auto& ele = arr.at(i);
     const char* capname = json_string_value(ele);
-    bool have = w_capability_supported(json_to_w_string(ele));
+    bool have = capability_supported(json_to_w_string(ele));
     if (!have) {
       have_all = false;
     }
     if (!capname) {
       break;
     }
-    set_prop(result, capname, json_boolean(have));
+    result.set(capname, json_boolean(have));
     if (required && !have) {
-      char *buf = NULL;
-      ignore_result(asprintf(&buf,
-            "client required capability `%s` is not supported by this server",
-            capname));
-      set_unicode_prop(response, "error", buf);
-      w_log(W_LOG_ERR, "version: %s\n", buf);
-      free(buf);
+      auto buf = w_string::build(
+          "client required capability `",
+          capname,
+          "` is not supported by this server");
+      response.set("error", w_string_to_json(buf));
+      watchman::log(watchman::ERR, "version: ", buf, "\n");
 
       // Only trigger the error on the first one we hit.  Ideally
       // we'd tell the user about all of them, but it is a PITA to
@@ -38,12 +42,12 @@ static bool query_caps(json_t *response, json_t *result,
 }
 
 /* version */
-static void cmd_version(struct watchman_client *client, json_t *args)
-{
-  json_t *resp = make_response();
+static void cmd_version(struct watchman_client* client, const json_ref& args) {
+  auto resp = make_response();
 
 #ifdef WATCHMAN_BUILD_INFO
-  set_unicode_prop(resp, "buildinfo", WATCHMAN_BUILD_INFO);
+  resp.set(
+      "buildinfo", typed_string_to_json(WATCHMAN_BUILD_INFO, W_STRING_UNICODE));
 #endif
 
   /* ["version"]
@@ -53,98 +57,100 @@ static void cmd_version(struct watchman_client *client, json_t *args)
    */
 
   if (json_array_size(args) == 2) {
-    const char *ignored;
-    json_t *req_cap = NULL;
-    json_t *opt_cap = NULL;
-    json_t *cap_res;
+    const auto& arg_obj = args.at(1);
 
-    json_unpack(args, "[s, {s?:o, s?:o}]",
-        &ignored,
-        "required", &req_cap,
-        "optional", &opt_cap);
+    auto req_cap = arg_obj.get_default("required");
+    auto opt_cap = arg_obj.get_default("optional");
 
-    cap_res = json_object_of_size(
+    auto cap_res = json_object_of_size(
         (opt_cap ? json_array_size(opt_cap) : 0) +
         (req_cap ? json_array_size(req_cap) : 0));
 
-    if (opt_cap && json_is_array(opt_cap)) {
+    if (opt_cap && opt_cap.isArray()) {
       query_caps(resp, cap_res, opt_cap, false);
     }
-    if (req_cap && json_is_array(req_cap)) {
+    if (req_cap && req_cap.isArray()) {
       query_caps(resp, cap_res, req_cap, true);
     }
 
-    set_prop(resp, "capabilities", cap_res);
+    resp.set("capabilities", std::move(cap_res));
   }
 
-  send_and_dispose_response(client, resp);
+  send_and_dispose_response(client, std::move(resp));
 }
-W_CMD_REG("version", cmd_version, CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER,
-          NULL)
+W_CMD_REG(
+    "version",
+    cmd_version,
+    CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER,
+    NULL)
 
 /* list-capabilities */
-static void cmd_list_capabilities(struct watchman_client *client,
-    json_t *args) {
-  json_t *resp = make_response();
-  unused_parameter(args);
+static void cmd_list_capabilities(
+    struct watchman_client* client,
+    const json_ref&) {
+  auto resp = make_response();
 
-  set_prop(resp, "capabilities", w_capability_get_list());
-  send_and_dispose_response(client, resp);
+  resp.set("capabilities", capability_get_list());
+  send_and_dispose_response(client, std::move(resp));
 }
-W_CMD_REG("list-capabilities", cmd_list_capabilities,
-          CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER, NULL)
+W_CMD_REG(
+    "list-capabilities",
+    cmd_list_capabilities,
+    CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER,
+    NULL)
 
 /* get-sockname */
-static void cmd_get_sockname(struct watchman_client *client, json_t *args)
-{
-  json_t *resp = make_response();
+static void cmd_get_sockname(struct watchman_client* client, const json_ref&) {
+  auto resp = make_response();
 
-  unused_parameter(args);
+  // For legacy reasons we report the unix domain socket as sockname on
+  // unix but the named pipe path on windows
+  resp.set(
+      "sockname",
+      w_string_to_json(w_string(get_sock_name_legacy(), W_STRING_BYTE)));
+  if (!disable_unix_socket) {
+    resp.set(
+        "unix_domain", w_string_to_json(w_string::build(get_unix_sock_name())));
+  }
 
-  set_bytestring_prop(resp, "sockname", get_sock_name());
+#ifdef WIN32
+  if (!disable_named_pipe) {
+    resp.set(
+        "named_pipe",
+        w_string_to_json(w_string::build(get_named_pipe_sock_path())));
+  }
+#endif
 
-  send_and_dispose_response(client, resp);
+  send_and_dispose_response(client, std::move(resp));
 }
-W_CMD_REG("get-sockname", cmd_get_sockname,
-          CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER, NULL)
+W_CMD_REG(
+    "get-sockname",
+    cmd_get_sockname,
+    CMD_DAEMON | CMD_CLIENT | CMD_ALLOW_ANY_USER,
+    NULL)
 
-static void cmd_get_config(struct watchman_client *client, json_t *args)
-{
-  json_t *resp;
-  json_t *config;
-  struct unlocked_watchman_root unlocked;
-  struct write_locked_watchman_root lock;
+static void cmd_get_config(
+    struct watchman_client* client,
+    const json_ref& args) {
+  json_ref config;
 
   if (json_array_size(args) != 2) {
     send_error_response(client, "wrong number of arguments for 'get-config'");
     return;
   }
 
-  if (!resolve_root_or_err(client, args, 1, false, &unlocked)) {
-    return;
-  }
+  auto root = resolveRoot(client, args);
 
-  resp = make_response();
+  auto resp = make_response();
 
-  w_root_lock(&unlocked, "cmd_get_config", &lock);
-  {
-    config = lock.root->config_file;
-    if (config) {
-      // set_prop will claim this ref
-      json_incref(config);
-    }
-  }
-  w_root_unlock(&lock, &unlocked);
+  config = root->config_file;
 
   if (!config) {
-    // set_prop will own this
     config = json_object();
   }
 
-  json_incref(unlocked.root->config_file);
-  set_prop(resp, "config", config);
-  send_and_dispose_response(client, resp);
-  w_root_delref(&unlocked);
+  resp.set("config", std::move(config));
+  send_and_dispose_response(client, std::move(resp));
 }
 W_CMD_REG("get-config", cmd_get_config, CMD_DAEMON, w_cmd_realpath_root)
 

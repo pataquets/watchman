@@ -2,74 +2,77 @@
  * Licensed under the Apache License, Version 2.0 */
 #include "watchman.h"
 
-static inline int which_fd(w_stm_t stm);
+using watchman::FileDescriptor;
+using namespace watchman;
 
-static int stdio_close(w_stm_t stm) {
-  unused_parameter(stm);
-  return -1;
-}
+namespace {
+class StdioStream : public watchman_stream {
+  const FileDescriptor& fd_;
 
-static int stdio_read(w_stm_t stm, void *buf, int size) {
-  return read(which_fd(stm), buf, size);
-}
+ public:
+  explicit StdioStream(const FileDescriptor& fd) : fd_(fd) {}
 
-static int stdio_write(w_stm_t stm, const void *buf, int size) {
-  return write(which_fd(stm), buf, size);
-}
-
-static void stdio_get_events(w_stm_t stm, w_evt_t *readable) {
-  unused_parameter(stm);
-  unused_parameter(readable);
-  w_log(W_LOG_FATAL, "calling get_events on a stdio stm\n");
-}
-
-static void stdio_set_nonb(w_stm_t stm, bool nonb) {
-  unused_parameter(stm);
-  unused_parameter(nonb);
-}
-
-static bool stdio_rewind(w_stm_t stm) {
-  unused_parameter(stm);
-  return false;
-}
-
-static bool stdio_shutdown(w_stm_t stm) {
-  unused_parameter(stm);
-  return false;
-}
-
-static struct watchman_stream_ops stdio_ops = {
-  stdio_close,
-  stdio_read,
-  stdio_write,
-  stdio_get_events,
-  stdio_set_nonb,
-  stdio_rewind,
-  stdio_shutdown,
-  NULL
-};
-
-static struct watchman_stream stm_stdout = {
-  (void*)&stdio_ops,
-  &stdio_ops
-};
-
-static struct watchman_stream stm_stdin = {
-  (void*)&stdio_ops,
-  &stdio_ops
-};
-
-static inline int which_fd(w_stm_t stm) {
-  if (stm == &stm_stdout) {
-    return STDOUT_FILENO;
+  int read(void* buf, int size) override {
+    auto result = fd_.read(buf, size);
+    if (result.hasError()) {
+      errno = result.error().value();
+#ifdef _WIN32
+      // TODO: propagate Result<int, std::error_code> as return type
+      errno = map_win32_err(errno);
+#endif
+      return -1;
+    }
+    return result.value();
   }
-  return STDIN_FILENO;
+
+  int write(const void* buf, int size) override {
+    auto result = fd_.write(buf, size);
+    if (result.hasError()) {
+      errno = result.error().value();
+#ifdef _WIN32
+      // TODO: propagate Result<int, std::error_code> as return type
+      errno = map_win32_err(errno);
+#endif
+      return -1;
+    }
+    return result.value();
+  }
+
+  w_evt_t getEvents() override {
+    log(FATAL, "calling get_events on a stdio stm\n");
+    return nullptr;
+  }
+
+  void setNonBlock(bool) override {}
+
+  bool rewind() override {
+    return false;
+  }
+
+  bool shutdown() override {
+    return false;
+  }
+
+  bool peerIsOwner() override {
+    return false;
+  }
+
+  pid_t getPeerProcessID() const override {
+    return 0;
+  }
+
+  const watchman::FileDescriptor& getFileDescriptor() const override {
+    return fd_;
+  }
+};
+} // namespace
+
+w_stm_t w_stm_stdout() {
+  static StdioStream stdoutStream(FileDescriptor::stdOut());
+  return &stdoutStream;
 }
 
-w_stm_t w_stm_stdout(void) {
-  return &stm_stdout;
-}
-
-w_stm_t w_stm_stdin(void) {
-  return &stm_stdin;
+w_stm_t w_stm_stdin() {
+  static StdioStream stdinStream(FileDescriptor::stdIn());
+  return &stdinStream;
 }

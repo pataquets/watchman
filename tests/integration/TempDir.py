@@ -1,50 +1,43 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 # no unicode literals
+from __future__ import absolute_import, division, print_function
+
+import atexit
+import errno
 import os
 import shutil
 import sys
 import tempfile
 import time
-import atexit
+
+import path_utils as path
+import pywatchman
+
 
 global_temp_dir = None
 
 
 class TempDir(object):
-    '''
+    """
     This is a helper for locating a reasonable place for temporary files.
     When run in the watchman test suite, we compute this up-front and then
     store everything under that temporary directory.
     When run under the FB internal test runner, we infer a reasonable grouped
     location from the process group environmental variable exported by the
     test runner.
-    '''
+    """
 
     def __init__(self, keepAtShutdown=False):
         # We'll put all our temporary stuff under one dir so that we
         # can clean it all up at the end.
 
-        # If we're running under an internal test runner, we prefer to put
-        # things in a dir relating to that runner.
-        parent_dir = tempfile.tempdir or os.environ.get('TMP', '/tmp')
+        parent_dir = tempfile.tempdir or os.environ.get("TMP", "/tmp")
+        prefix = "watchmantest"
 
-        if 'TESTPILOT_PROCESS_GROUP' in os.environ:
-            parent_dir = os.path.join(
-                parent_dir,
-                'watchmantest-%s' % (os.environ['TESTPILOT_PROCESS_GROUP'])
-            )
-            if not os.path.exists(parent_dir):
-                os.mkdir(parent_dir)
+        self.temp_dir = path.get_canonical_filesystem_path(
+            tempfile.mkdtemp(dir=parent_dir, prefix=prefix)
+        )
 
-            prefix = ''
-        else:
-            prefix = 'watchmantest'
-
-        self.temp_dir = os.path.normcase(os.path.realpath(
-            tempfile.mkdtemp(dir=parent_dir, prefix=prefix)))
-        if os.name != 'nt':
+        if os.name != "nt":
             # On some platforms, setting the setgid bit on a directory doesn't
             # work if the user isn't a member of the directory's group. Set the
             # group explicitly to avoid this.
@@ -53,13 +46,16 @@ class TempDir(object):
             # directories too open and break tests.
             os.umask(0o022)
         # Redirect all temporary files to that location
-        tempfile.tempdir = self.temp_dir
+        if pywatchman.compat.PYTHON3:
+            tempfile.tempdir = os.fsdecode(self.temp_dir)
+        else:
+            tempfile.tempdir = self.temp_dir
 
         self.keep = keepAtShutdown
 
         def cleanup():
             if self.keep:
-                sys.stdout.write('Preserving output in %s\n' % self.temp_dir)
+                sys.stdout.write("Preserving output in %s\n" % self.temp_dir)
                 return
             self._retry_rmtree(self.temp_dir)
 
@@ -74,12 +70,35 @@ class TempDir(object):
     def _retry_rmtree(self, top):
         # Keep trying to remove it; on Windows it may take a few moments
         # for any outstanding locks/handles to be released
-        for i in range(1, 10):
-            shutil.rmtree(top, ignore_errors=True)
+        for _ in range(1, 10):
+            shutil.rmtree(top, onerror=_remove_readonly)
             if not os.path.isdir(top):
                 return
+            sys.stdout.write("Waiting to remove temp data under %s\n" % top)
             time.sleep(0.2)
-        sys.stdout.write('Failed to completely remove ' + top)
+        sys.stdout.write("Failed to completely remove %s\n" % top)
+
+
+def _remove_readonly(func, path, exc_info):
+    # If we encounter an EPERM or EACCESS error removing a file try making its parent
+    # directory writable and then retry the removal.  This is necessary to clean up
+    # eden mount point directories after the checkout is unmounted, as these directories
+    # are made read-only by "eden clone"
+    _ex_type, ex, _traceback = exc_info
+    if not (
+        isinstance(ex, EnvironmentError) and ex.errno in (errno.EACCES, errno.EPERM)
+    ):
+        # Just ignore other errors.  This will be retried by _retry_rmtree()
+        return
+
+    try:
+        parent_dir = os.path.dirname(path)
+        os.chmod(parent_dir, 0o755)
+        # func() is the function that failed.
+        # This is usually os.unlink() or os.rmdir().
+        func(path)
+    except OSError:
+        return
 
 
 def get_temp_dir(keep=None):
@@ -87,6 +106,6 @@ def get_temp_dir(keep=None):
     if global_temp_dir:
         return global_temp_dir
     if keep is None:
-        keep = os.environ.get('WATCHMAN_TEST_KEEP', '0') == '1'
+        keep = os.environ.get("WATCHMAN_TEST_KEEP", "0") == "1"
     global_temp_dir = TempDir(keep)
     return global_temp_dir

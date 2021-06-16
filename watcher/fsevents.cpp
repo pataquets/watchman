@@ -2,73 +2,114 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include "fsevents.h"
+#include <folly/String.h>
+#include <folly/Synchronized.h>
+#include <condition_variable>
+#include <iterator>
+#include <mutex>
+#include <vector>
+#include "InMemoryView.h"
+#include "LogConfig.h"
+#include "Pipe.h"
 
 #if HAVE_FSEVENTS
 
+namespace watchman {
+
 // The FSEventStreamSetExclusionPaths API has a limit of 8 items.
 // If that limit is exceeded, it will fail.
-#define MAX_EXCLUSIONS 8
-
-struct watchman_fsevent {
-  struct watchman_fsevent *next;
-  w_string_t *path;
-  FSEventStreamEventFlags flags;
-};
+#define MAX_EXCLUSIONS size_t(8)
 
 struct fse_stream {
-  FSEventStreamRef stream;
-  w_root_t *root;
-  FSEventStreamEventId last_good;
-  FSEventStreamEventId since;
-  bool lost_sync;
-  bool inject_drop;
-  bool event_id_wrapped;
+  FSEventStreamRef stream{nullptr};
+  std::shared_ptr<watchman_root> root;
+  FSEventsWatcher* watcher;
+  FSEventStreamEventId last_good{0};
+  FSEventStreamEventId since{0};
+  bool lost_sync{false};
+  bool inject_drop{false};
+  bool event_id_wrapped{false};
   CFUUIDRef uuid;
+
+  fse_stream(
+      const std::shared_ptr<watchman_root>& root,
+      FSEventsWatcher* watcher,
+      FSEventStreamEventId since)
+      : root(root), watcher(watcher), since(since) {}
+  ~fse_stream();
 };
 
-struct fsevents_root_state {
-  int fse_pipe[2];
-
-  pthread_mutex_t fse_mtx;
-  pthread_cond_t fse_cond;
-  pthread_t fse_thread;
-
-  struct watchman_fsevent *fse_head, *fse_tail;
-  struct fse_stream *stream;
-  bool attempt_resync_on_drop;
+static const flag_map kflags[] = {
+    {kFSEventStreamEventFlagMustScanSubDirs, "MustScanSubDirs"},
+    {kFSEventStreamEventFlagUserDropped, "UserDropped"},
+    {kFSEventStreamEventFlagKernelDropped, "KernelDropped"},
+    {kFSEventStreamEventFlagEventIdsWrapped, "EventIdsWrapped"},
+    {kFSEventStreamEventFlagHistoryDone, "HistoryDone"},
+    {kFSEventStreamEventFlagRootChanged, "RootChanged"},
+    {kFSEventStreamEventFlagMount, "Mount"},
+    {kFSEventStreamEventFlagUnmount, "Unmount"},
+    {kFSEventStreamEventFlagItemCreated, "ItemCreated"},
+    {kFSEventStreamEventFlagItemRemoved, "ItemRemoved"},
+    {kFSEventStreamEventFlagItemInodeMetaMod, "InodeMetaMod"},
+    {kFSEventStreamEventFlagItemRenamed, "ItemRenamed"},
+    {kFSEventStreamEventFlagItemModified, "ItemModified"},
+    {kFSEventStreamEventFlagItemFinderInfoMod, "FinderInfoMod"},
+    {kFSEventStreamEventFlagItemChangeOwner, "ItemChangeOwner"},
+    {kFSEventStreamEventFlagItemXattrMod, "ItemXattrMod"},
+    {kFSEventStreamEventFlagItemIsFile, "ItemIsFile"},
+    {kFSEventStreamEventFlagItemIsDir, "ItemIsDir"},
+    {kFSEventStreamEventFlagItemIsSymlink, "ItemIsSymlink"},
+    {0, nullptr},
 };
 
-static const struct flag_map kflags[] = {
-  {kFSEventStreamEventFlagMustScanSubDirs, "MustScanSubDirs"},
-  {kFSEventStreamEventFlagUserDropped, "UserDropped"},
-  {kFSEventStreamEventFlagKernelDropped, "KernelDropped"},
-  {kFSEventStreamEventFlagEventIdsWrapped, "EventIdsWrapped"},
-  {kFSEventStreamEventFlagHistoryDone, "HistoryDone"},
-  {kFSEventStreamEventFlagRootChanged, "RootChanged"},
-  {kFSEventStreamEventFlagMount, "Mount"},
-  {kFSEventStreamEventFlagUnmount, "Unmount"},
-  {kFSEventStreamEventFlagItemCreated, "ItemCreated"},
-  {kFSEventStreamEventFlagItemRemoved, "ItemRemoved"},
-  {kFSEventStreamEventFlagItemInodeMetaMod, "InodeMetaMod"},
-  {kFSEventStreamEventFlagItemRenamed, "ItemRenamed"},
-  {kFSEventStreamEventFlagItemModified, "ItemModified"},
-  {kFSEventStreamEventFlagItemFinderInfoMod, "FinderInfoMod"},
-  {kFSEventStreamEventFlagItemChangeOwner, "ItemChangeOwner"},
-  {kFSEventStreamEventFlagItemXattrMod, "ItemXattrMod"},
-  {kFSEventStreamEventFlagItemIsFile, "ItemIsFile"},
-  {kFSEventStreamEventFlagItemIsDir, "ItemIsDir"},
-  {kFSEventStreamEventFlagItemIsSymlink, "ItemIsSymlink"},
-  {0, NULL},
-};
+struct FSEventsLogEntry {
+  // 60 should cover many filenames.
+  static constexpr size_t kNameLength = 60;
 
-static struct fse_stream* fse_stream_make(
-    w_root_t* root,
+  FSEventsLogEntry() = default;
+
+  explicit FSEventsLogEntry(uint32_t flags, const char* name) noexcept {
+    this->flags = flags;
+    auto piece = w_string_piece{name}; // Evaluate strlen here.
+    storeTruncatedTail(this->name, piece);
+  }
+
+  json_ref asJsonValue() {
+    size_t length = strnlen(name, kNameLength);
+    auto namePiece = w_string_piece{name, length};
+
+    return json_object({
+        {"flags", json_integer(flags)},
+        {"name", typed_string_to_json(namePiece.asWString())},
+    });
+  }
+
+  uint32_t flags;
+  char name[kNameLength];
+};
+static_assert(64 == sizeof(FSEventsLogEntry));
+
+static fse_stream* fse_stream_make(
+    const std::shared_ptr<watchman_root>& root,
+    FSEventsWatcher* watcher,
     FSEventStreamEventId since,
     w_string& failure_reason);
-static void fse_stream_free(struct fse_stream *fse_stream);
+
+std::shared_ptr<FSEventsWatcher> watcherFromRoot(
+    const std::shared_ptr<watchman_root>& root) {
+  auto view = std::dynamic_pointer_cast<watchman::InMemoryView>(root->view());
+  if (!view) {
+    return nullptr;
+  }
+
+  return std::dynamic_pointer_cast<FSEventsWatcher>(view->getWatcher());
+}
 
 /** Generate a perf event for the drop */
-static void log_drop_event(w_root_t *root, bool isKernel) {
+static void log_drop_event(
+    const std::shared_ptr<watchman_root>& root,
+    bool isKernel) {
   w_perf_t sample(isKernel ? "KernelDropped" : "UserDropped");
   sample.add_root_meta(root);
   sample.finish();
@@ -76,21 +117,29 @@ static void log_drop_event(w_root_t *root, bool isKernel) {
   sample.log();
 }
 
-static void fse_callback(ConstFSEventStreamRef streamRef,
-   void *clientCallBackInfo,
-   size_t numEvents,
-   void *eventPaths,
-   const FSEventStreamEventFlags eventFlags[],
-   const FSEventStreamEventId eventIds[])
-{
+static void fse_callback(
+    ConstFSEventStreamRef,
+    void* clientCallBackInfo,
+    size_t numEvents,
+    void* eventPaths,
+    const FSEventStreamEventFlags eventFlags[],
+    const FSEventStreamEventId eventIds[]) {
   size_t i;
   auto paths = (char**)eventPaths;
-  auto stream = (fse_stream *)clientCallBackInfo;
-  w_root_t *root = stream->root;
-  struct watchman_fsevent *head = NULL, *tail = NULL, *evt;
-  auto state = (fsevents_root_state*)root->inner.watch;
+  auto stream = (fse_stream*)clientCallBackInfo;
+  auto root = stream->root;
+  std::vector<watchman_fsevent> items;
+  auto watcher = stream->watcher;
 
-  unused_parameter(streamRef);
+  stream->watcher->totalEventsSeen_.fetch_add(
+      numEvents, std::memory_order_relaxed);
+  if (stream->watcher->ringBuffer_) {
+    for (i = 0; i < numEvents; i++) {
+      uint32_t flags = eventFlags[i];
+      const char* path = paths[i];
+      stream->watcher->ringBuffer_->write(FSEventsLogEntry{flags, path});
+    }
+  }
 
   if (!stream->lost_sync) {
     // This is to facilitate testing via debug-fsevents-inject-drop.
@@ -104,62 +153,70 @@ static void fse_callback(ConstFSEventStreamRef streamRef,
     // processing the events from the point at which we lost sync, so we have
     // to check this before we start allocating events for the consumer.
     for (i = 0; i < numEvents; i++) {
-      if ((eventFlags[i] & (kFSEventStreamEventFlagUserDropped |
-                            kFSEventStreamEventFlagKernelDropped)) != 0) {
+      if ((eventFlags[i] &
+           (kFSEventStreamEventFlagUserDropped |
+            kFSEventStreamEventFlagKernelDropped)) != 0) {
         // We don't ever need to clear lost_sync as the code below will either
         // set up a new stream instance with it cleared, or will recrawl and
         // set up a whole new state for the recrawled instance.
         stream->lost_sync = true;
 
-        log_drop_event(root,
-                       eventFlags[i] & kFSEventStreamEventFlagKernelDropped);
+        log_drop_event(
+            root, eventFlags[i] & kFSEventStreamEventFlagKernelDropped);
 
-        if (state->attempt_resync_on_drop) {
-          // fseventsd has a reliable journal so we can attempt to resync.
-do_resync:
+        if (watcher->attempt_resync_on_drop) {
+        // fseventsd has a reliable journal so we can attempt to resync.
+        do_resync:
           if (stream->event_id_wrapped) {
-            w_log(W_LOG_ERR, "fsevents lost sync and the event_ids wrapped, so "
-                             "we have no choice but to do a full recrawl\n");
+            logf(
+                ERR,
+                "fsevents lost sync and the event_ids wrapped, so "
+                "we have no choice but to do a full recrawl\n");
             // Allow the Dropped event to propagate and trigger a recrawl
             goto propagate;
           }
 
-          if (state->stream == stream) {
+          if (watcher->stream == stream) {
             // We are the active stream for this watch which means that it
-            // is safe for us to proceed with changing state->stream.
+            // is safe for us to proceed with changing watcher->stream.
             // Attempt to set up a new stream to resync from the last-good
             // event.  If successful, that will replace the current stream.
             // If we fail, then we allow the UserDropped event to propagate
             // to the consumer thread which has existing logic to schedule
             // a recrawl.
             w_string failure_reason;
-            struct fse_stream *replacement =
-                fse_stream_make(root, stream->last_good, failure_reason);
+            fse_stream* replacement = fse_stream_make(
+                root, watcher, stream->last_good, failure_reason);
 
             if (!replacement) {
-              w_log(W_LOG_ERR,
-                    "Failed to rebuild fsevent stream (%s) while trying to "
-                    "resync, falling back to a regular recrawl\n",
-                    failure_reason.c_str());
+              logf(
+                  ERR,
+                  "Failed to rebuild fsevent stream ({}) while trying to "
+                  "resync, falling back to a regular recrawl\n",
+                  failure_reason);
               // Allow the UserDropped event to propagate and trigger a recrawl
               goto propagate;
             }
 
             if (!FSEventStreamStart(replacement->stream)) {
-              w_log(W_LOG_ERR, "FSEventStreamStart failed while trying to "
-                               "resync, falling back to a regular recrawl\n");
+              logf(
+                  ERR,
+                  "FSEventStreamStart failed while trying to "
+                  "resync, falling back to a regular recrawl\n");
               // Allow the UserDropped event to propagate and trigger a recrawl
               goto propagate;
             }
 
-            w_log(W_LOG_ERR, "Lost sync, so resync from last_good event %llu\n",
-                  stream->last_good);
+            logf(
+                ERR,
+                "Lost sync, so resync from last_good event {}\n",
+                stream->last_good);
 
             // mark the replacement as the winner
-            state->stream = replacement;
+            watcher->stream = replacement;
 
             // And tear ourselves down
-            fse_stream_free(stream);
+            delete stream;
 
             // And we're done.
             return;
@@ -168,7 +225,7 @@ do_resync:
         break;
       }
     }
-  } else if (state->attempt_resync_on_drop) {
+  } else if (watcher->attempt_resync_on_drop) {
     // This stream has already lost sync and our policy is to resync
     // for ourselves.  This is most likely a spurious callback triggered
     // after we'd taken action above.  We just ignore further events
@@ -178,17 +235,20 @@ do_resync:
 
 propagate:
 
+  items.reserve(numEvents);
   for (i = 0; i < numEvents; i++) {
-    uint32_t len;
-    const char *path = paths[i];
+    const char* path = paths[i];
 
     if (eventFlags[i] & kFSEventStreamEventFlagHistoryDone) {
       // The docs say to ignore this event; it's just a marker informing
       // us that a resync completed.  Take this opportunity to log how
       // many events were replayed to catch up.
-      w_log(W_LOG_ERR, "Historical resync completed at event id %llu (caught "
-                       "up on %llu events)\n",
-            eventIds[i], eventIds[i] - stream->since);
+      logf(
+          ERR,
+          "Historical resync completed at event id {} (caught "
+          "up on {} events)\n",
+          eventIds[i],
+          eventIds[i] - stream->since);
       continue;
     }
 
@@ -196,93 +256,58 @@ propagate:
       stream->event_id_wrapped = true;
     }
 
-    len = strlen(path);
-    while (path[len-1] == '/') {
+    uint32_t len = strlen(path);
+    while (path[len - 1] == '/') {
       len--;
     }
 
-    if (w_ignore_check(&root->ignore, path, len)) {
+    if (root->ignore.isIgnored(path, len)) {
       continue;
     }
 
-    evt = (watchman_fsevent*)calloc(1, sizeof(*evt));
-    if (!evt) {
-      w_log(W_LOG_DBG, "FSEvents: OOM!");
-      w_root_cancel(root);
-      break;
-    }
-
-    evt->path = w_string_new_len_typed(path, len, W_STRING_BYTE);
-    evt->flags = eventFlags[i];
+    items.emplace_back(w_string(path, len), eventFlags[i]);
     if (!stream->lost_sync) {
       stream->last_good = eventIds[i];
     }
-    if (tail) {
-      tail->next = evt;
-    } else {
-      head = evt;
-    }
-    tail = evt;
   }
 
-  if (!head) {
-    return;
+  if (!items.empty()) {
+    auto wlock = watcher->items_.lock();
+    wlock->items.push_back(std::move(items));
+    watcher->fse_cond.notify_one();
   }
-
-  pthread_mutex_lock(&state->fse_mtx);
-  if (state->fse_tail) {
-    state->fse_tail->next = head;
-  } else {
-    state->fse_head = head;
-  }
-  state->fse_tail = tail;
-  pthread_mutex_unlock(&state->fse_mtx);
-  pthread_cond_signal(&state->fse_cond);
 }
 
-static void fse_pipe_callback(CFFileDescriptorRef fdref,
-      CFOptionFlags callBackTypes, void *info)
-{
-  auto root = (w_root_t*)info;
-
-  unused_parameter(fdref);
-  unused_parameter(callBackTypes);
-  unused_parameter(root);
-
-  w_log(W_LOG_DBG, "pipe signalled\n");
+static void fse_pipe_callback(CFFileDescriptorRef, CFOptionFlags, void*) {
+  logf(DBG, "pipe signalled\n");
   CFRunLoopStop(CFRunLoopGetCurrent());
 }
 
-static void fse_stream_free(struct fse_stream *fse_stream) {
-  if (fse_stream->stream) {
-    FSEventStreamStop(fse_stream->stream);
-    FSEventStreamInvalidate(fse_stream->stream);
-    FSEventStreamRelease(fse_stream->stream);
+fse_stream::~fse_stream() {
+  if (stream) {
+    FSEventStreamStop(stream);
+    FSEventStreamInvalidate(stream);
+    FSEventStreamRelease(stream);
   }
-  if (fse_stream->uuid) {
-    CFRelease(fse_stream->uuid);
+  if (uuid) {
+    CFRelease(uuid);
   }
 }
 
-static struct fse_stream* fse_stream_make(
-    w_root_t* root,
+static fse_stream* fse_stream_make(
+    const std::shared_ptr<watchman_root>& root,
+    FSEventsWatcher* watcher,
     FSEventStreamEventId since,
     w_string& failure_reason) {
-  FSEventStreamContext ctx;
-  CFMutableArrayRef parray = NULL;
-  CFStringRef cpath = NULL;
+  auto ctx = FSEventStreamContext();
+  CFMutableArrayRef parray = nullptr;
+  CFStringRef cpath = nullptr;
   double latency;
-  struct fse_stream *fse_stream = (struct fse_stream*)calloc(1, sizeof(*fse_stream));
   struct stat st;
-  auto state = (fsevents_root_state*)root->inner.watch;
+  FSEventStreamCreateFlags flags;
+  w_string path;
 
-  if (!fse_stream) {
-    // Note that w_string_new will terminate the process on OOM
-    failure_reason = w_string("OOM", W_STRING_UNICODE);
-    goto fail;
-  }
-  fse_stream->root = root;
-  fse_stream->since = since;
+  fse_stream* fse_stream = new struct fse_stream(root, watcher, since);
 
   // Each device has an optional journal maintained by fseventsd that keeps
   // track of the change events.  The journal may not be available if the
@@ -293,8 +318,12 @@ static struct fse_stream* fse_stream_make(
   // We need to lookup up the UUID for the associated path and use that to
   // help decide whether we can use a value of `since` other than SinceNow.
   if (stat(root->root_path.c_str(), &st)) {
-    failure_reason = w_string::printf(
-        "failed to stat(%s): %s\n", root->root_path.c_str(), strerror(errno));
+    failure_reason = w_string::build(
+        "failed to stat(",
+        root->root_path,
+        "): ",
+        folly::errnoStr(errno),
+        "\n");
     goto fail;
   }
 
@@ -305,13 +334,13 @@ static struct fse_stream* fse_stream_make(
 
     if (!fse_stream->uuid) {
       // If there is no UUID available and we want to use an event offset,
-      // we fail: a NULL UUID means that the journal is not available.
-      failure_reason = w_string::printf(
-          "fsevents journal is not available for dev_t=%lu\n", st.st_dev);
+      // we fail: a nullptr UUID means that the journal is not available.
+      failure_reason = w_string::build(
+          "fsevents journal is not available for dev_t=", st.st_dev, "\n");
       goto fail;
     }
     // Compare the UUID with that of the current stream
-    if (!state->stream->uuid) {
+    if (!watcher->stream->uuid) {
       failure_reason = w_string(
           "fsevents journal was not available for prior stream",
           W_STRING_UNICODE);
@@ -319,7 +348,7 @@ static struct fse_stream* fse_stream_make(
     }
 
     a = CFUUIDGetUUIDBytes(fse_stream->uuid);
-    b = CFUUIDGetUUIDBytes(state->stream->uuid);
+    b = CFUUIDGetUUIDBytes(watcher->stream->uuid);
 
     if (memcmp(&a, &b, sizeof(a)) != 0) {
       failure_reason =
@@ -328,19 +357,24 @@ static struct fse_stream* fse_stream_make(
     }
   }
 
-  memset(&ctx, 0, sizeof(ctx));
   ctx.info = fse_stream;
 
-  parray = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+  parray = CFArrayCreateMutable(nullptr, 0, &kCFTypeArrayCallBacks);
   if (!parray) {
     failure_reason = w_string("CFArrayCreateMutable failed", W_STRING_UNICODE);
     goto fail;
   }
 
+  if (auto subdir = watcher->subdir) {
+    path = *subdir;
+  } else {
+    path = root->root_path;
+  }
+
   cpath = CFStringCreateWithBytes(
       nullptr,
-      (const UInt8*)root->root_path.data(),
-      root->root_path.size(),
+      (const UInt8*)path.data(),
+      path.size(),
       kCFStringEncodingUTF8,
       false);
   if (!cpath) {
@@ -351,48 +385,56 @@ static struct fse_stream* fse_stream_make(
 
   CFArrayAppendValue(parray, cpath);
 
-  latency = cfg_get_double(root, "fsevents_latency", 0.01),
-  w_log(
-      W_LOG_DBG,
-      "FSEventStreamCreate for path %s with latency %f seconds\n",
-      root->root_path.c_str(),
+  latency = root->config.getDouble("fsevents_latency", 0.01),
+  logf(
+      DBG,
+      "FSEventStreamCreate for path {} with latency {} seconds\n",
+      path,
       latency);
 
-  fse_stream->stream = FSEventStreamCreate(NULL, fse_callback,
-      &ctx, parray, since,
-      latency,
-      kFSEventStreamCreateFlagNoDefer|
-      kFSEventStreamCreateFlagWatchRoot|
-      kFSEventStreamCreateFlagFileEvents);
+  flags = kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagWatchRoot;
+  if (watcher->has_file_watching) {
+    flags |= kFSEventStreamCreateFlagFileEvents;
+  }
+  fse_stream->stream = FSEventStreamCreate(
+      nullptr, fse_callback, &ctx, parray, since, latency, flags);
 
   if (!fse_stream->stream) {
     failure_reason = w_string("FSEventStreamCreate failed", W_STRING_UNICODE);
     goto fail;
   }
 
-  FSEventStreamScheduleWithRunLoop(fse_stream->stream,
-      CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+  FSEventStreamScheduleWithRunLoop(
+      fse_stream->stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
 
-#ifdef HAVE_FSEVENTSTREAMSETEXCLUSIONPATHS
-  if (w_ht_size(root->ignore.ignore_dirs) > 0 &&
-      cfg_get_bool(root, "_use_fsevents_exclusions", true)) {
+  if (root->config.getBool("_use_fsevents_exclusions", true)) {
     CFMutableArrayRef ignarray;
-    size_t i, nitems = MIN(w_ht_size(root->ignore.ignore_dirs), MAX_EXCLUSIONS);
+    size_t nitems = std::min(root->ignore.dirs_vec.size(), MAX_EXCLUSIONS);
+    size_t appended = 0;
 
-    ignarray = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    ignarray = CFArrayCreateMutable(nullptr, 0, &kCFTypeArrayCallBacks);
     if (!ignarray) {
       failure_reason =
           w_string("CFArrayCreateMutable failed", W_STRING_UNICODE);
       goto fail;
     }
 
-    for (i = 0; i < nitems; ++i) {
-      w_string_t *path = root->ignore.dirs_vec[i];
+    for (const auto& path : root->ignore.dirs_vec) {
+      if (const auto& subdir = watcher->subdir) {
+        if (!w_string_startswith(path, *subdir)) {
+          continue;
+        }
+        logf(DBG, "Adding exclusion: {} for subdir: {}\n", path, *subdir);
+      }
+
       CFStringRef ignpath;
 
       ignpath = CFStringCreateWithBytes(
-          NULL, (const UInt8 *)path->buf, path->len,
-          kCFStringEncodingUTF8, false);
+          nullptr,
+          (const UInt8*)path.data(),
+          path.size(),
+          kCFStringEncodingUTF8,
+          false);
 
       if (!ignpath) {
         failure_reason =
@@ -403,18 +445,24 @@ static struct fse_stream* fse_stream_make(
 
       CFArrayAppendValue(ignarray, ignpath);
       CFRelease(ignpath);
+
+      appended++;
+      if (appended == nitems) {
+        break;
+      }
     }
 
-    if (!FSEventStreamSetExclusionPaths(fse_stream->stream, ignarray)) {
-      failure_reason =
-          w_string("FSEventStreamSetExclusionPaths failed", W_STRING_UNICODE);
-      CFRelease(ignarray);
-      goto fail;
+    if (appended != 0) {
+      if (!FSEventStreamSetExclusionPaths(fse_stream->stream, ignarray)) {
+        failure_reason =
+            w_string("FSEventStreamSetExclusionPaths failed", W_STRING_UNICODE);
+        CFRelease(ignarray);
+        goto fail;
+      }
     }
 
     CFRelease(ignarray);
   }
-#endif
 
 out:
   if (parray) {
@@ -427,340 +475,357 @@ out:
   return fse_stream;
 
 fail:
-  fse_stream_free(fse_stream);
-  fse_stream = NULL;
+  delete fse_stream;
+  fse_stream = nullptr;
   goto out;
 }
 
-static void *fsevents_thread(void *arg)
-{
-  auto root = (w_root_t *)arg;
+void FSEventsWatcher::FSEventsThread(
+    const std::shared_ptr<watchman_root>& root) {
   CFFileDescriptorRef fdref;
-  CFFileDescriptorContext fdctx;
-  auto state = (fsevents_root_state *)root->inner.watch;
+  auto fdctx = CFFileDescriptorContext();
 
-  w_set_thread_name("fsevents %s", root->root_path.c_str());
+  w_set_thread_name("fsevents ", root->root_path);
 
-  // Block until fsevents_root_start is waiting for our initialization
-  pthread_mutex_lock(&state->fse_mtx);
-
-  state->attempt_resync_on_drop =
-      cfg_get_bool(root, "fsevents_try_resync", true);
-
-  memset(&fdctx, 0, sizeof(fdctx));
-  fdctx.info = root;
-
-  fdref = CFFileDescriptorCreate(NULL, state->fse_pipe[0], true,
-      fse_pipe_callback, &fdctx);
-  CFFileDescriptorEnableCallBacks(fdref, kCFFileDescriptorReadCallBack);
   {
-    CFRunLoopSourceRef fdsrc;
+    // Block until fsevents_root_start is waiting for our initialization
+    auto wlock = items_.lock();
 
-    fdsrc = CFFileDescriptorCreateRunLoopSource(NULL, fdref, 0);
-    if (!fdsrc) {
-      root->failure_reason = w_string_new_typed(
-          "CFFileDescriptorCreateRunLoopSource failed", W_STRING_UNICODE);
+    attempt_resync_on_drop = root->config.getBool("fsevents_try_resync", true);
+
+    fdctx.info = root.get();
+
+    fdref = CFFileDescriptorCreate(
+        nullptr, fse_pipe.read.fd(), true, fse_pipe_callback, &fdctx);
+    CFFileDescriptorEnableCallBacks(fdref, kCFFileDescriptorReadCallBack);
+    {
+      CFRunLoopSourceRef fdsrc;
+
+      fdsrc = CFFileDescriptorCreateRunLoopSource(nullptr, fdref, 0);
+      if (!fdsrc) {
+        root->failure_reason = w_string(
+            "CFFileDescriptorCreateRunLoopSource failed", W_STRING_UNICODE);
+        goto done;
+      }
+      CFRunLoopAddSource(CFRunLoopGetCurrent(), fdsrc, kCFRunLoopDefaultMode);
+      CFRelease(fdsrc);
+    }
+
+    stream = fse_stream_make(
+        root, this, kFSEventStreamEventIdSinceNow, root->failure_reason);
+    if (!stream) {
       goto done;
     }
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), fdsrc, kCFRunLoopDefaultMode);
-    CFRelease(fdsrc);
-  }
 
-  state->stream = fse_stream_make(
-      root, kFSEventStreamEventIdSinceNow, root->failure_reason);
-  if (!state->stream) {
-    goto done;
-  }
+    if (!FSEventStreamStart(stream->stream)) {
+      root->failure_reason = w_string::build(
+          "FSEventStreamStart failed, look at your log file ",
+          log_name,
+          " for lines mentioning FSEvents and see ",
+          cfg_get_trouble_url(),
+          "#fsevents for more information\n");
+      goto done;
+    }
 
-  if (!FSEventStreamStart(state->stream->stream)) {
-    root->failure_reason = w_string::printf(
-        "FSEventStreamStart failed, look at your log file %s for "
-        "lines mentioning FSEvents and see %s#fsevents for more information\n",
-        log_name,
-        cfg_get_trouble_url());
-    goto done;
+    // Signal to fsevents_root_start that we're done initializing
+    fse_cond.notify_one();
   }
-
-  // Signal to fsevents_root_start that we're done initializing
-  pthread_cond_signal(&state->fse_cond);
-  pthread_mutex_unlock(&state->fse_mtx);
 
   // Process the events stream until we get signalled to quit
   CFRunLoopRun();
 
-  // Since the goto's above hold fse_mtx, we should grab it here
-  pthread_mutex_lock(&state->fse_mtx);
 done:
-  if (state->stream) {
-    fse_stream_free(state->stream);
+  if (stream) {
+    delete stream;
   }
   if (fdref) {
     CFRelease(fdref);
   }
 
-  // Signal to fsevents_root_start that we're done initializing in
-  // the failure path.  We'll also do this after we've completed
-  // the run loop in the success path; it's a spurious wakeup but
-  // harmless and saves us from adding and setting a control flag
-  // in each of the failure `goto` statements. fsevents_root_dtor
-  // will `pthread_join` us before `state` is freed.
-  pthread_cond_signal(&state->fse_cond);
-  pthread_mutex_unlock(&state->fse_mtx);
-
-  w_log(W_LOG_DBG, "fse_thread done\n");
-  w_root_delref_raw(root);
-  return NULL;
+  logf(DBG, "fse_thread done\n");
 }
 
-static bool fsevents_root_consume_notify(w_root_t *root,
-    struct watchman_pending_collection *coll)
-{
-  struct watchman_fsevent *head, *evt;
-  int n = 0;
-  struct timeval now;
-  bool recurse;
-  auto state = (fsevents_root_state *)root->inner.watch;
-  char flags_label[128];
-
-  pthread_mutex_lock(&state->fse_mtx);
-  head = state->fse_head;
-  state->fse_head = NULL;
-  state->fse_tail = NULL;
-  pthread_mutex_unlock(&state->fse_mtx);
-
-  gettimeofday(&now, 0);
-
-  while (head) {
-    evt = head;
-    head = head->next;
-    n++;
-
-    w_expand_flags(kflags, evt->flags, flags_label, sizeof(flags_label));
-    w_log(W_LOG_DBG, "fsevents: got %.*s 0x%" PRIx32 " %s\n", evt->path->len,
-          evt->path->buf, evt->flags, flags_label);
-
-    if (evt->flags & kFSEventStreamEventFlagUserDropped) {
-      w_root_schedule_recrawl(root, "kFSEventStreamEventFlagUserDropped");
-break_out:
-      w_string_delref(evt->path);
-      free(evt);
-      break;
-    }
-
-    if (evt->flags & kFSEventStreamEventFlagKernelDropped) {
-      w_root_schedule_recrawl(root, "kFSEventStreamEventFlagKernelDropped");
-      goto break_out;
-    }
-
-    if (evt->flags & kFSEventStreamEventFlagUnmount) {
-      w_log(W_LOG_ERR, "kFSEventStreamEventFlagUnmount %.*s, cancel watch\n",
-        evt->path->len, evt->path->buf);
-      w_root_cancel(root);
-      goto break_out;
-    }
-
-    if (evt->flags & kFSEventStreamEventFlagRootChanged) {
-      w_log(W_LOG_ERR,
-        "kFSEventStreamEventFlagRootChanged %.*s, cancel watch\n",
-        evt->path->len, evt->path->buf);
-      w_root_cancel(root);
-      goto break_out;
-    }
-
-    recurse = (evt->flags &
-                (kFSEventStreamEventFlagMustScanSubDirs|
-                 kFSEventStreamEventFlagItemRenamed))
-              ? true : false;
-
-    w_pending_coll_add(coll, evt->path, now,
-        W_PENDING_VIA_NOTIFY | (recurse ? W_PENDING_RECURSIVE : 0));
-
-    w_string_delref(evt->path);
-    free(evt);
-  }
-
-  return n > 0;
+FSEventsWatcher::FSEventsWatcher(
+    bool hasFileWatching,
+    std::optional<w_string> dir)
+    : Watcher(
+          hasFileWatching ? "fsevents" : "dirfsevents",
+          hasFileWatching
+              ? (WATCHER_HAS_PER_FILE_NOTIFICATIONS | WATCHER_COALESCED_RENAME)
+              : WATCHER_ONLY_DIRECTORY_NOTIFICATIONS),
+      has_file_watching(hasFileWatching),
+      subdir(std::move(dir)) {
+  // TODO: Add ring buffer logging for events in the shared kqueue+fsevents
+  // logger.
 }
 
-bool fsevents_root_init(w_root_t *root, char **errmsg) {
-  struct fsevents_root_state *state;
-
-  state = (fsevents_root_state*)calloc(1, sizeof(*state));
-  if (!state) {
-    *errmsg = strdup("out of memory");
-    return false;
+FSEventsWatcher::FSEventsWatcher(
+    watchman_root* root,
+    std::optional<w_string> dir)
+    : FSEventsWatcher(root->config.getBool("fsevents_watch_files", true), dir) {
+  json_int_t fsevents_ring_log_size =
+      root->config.getInt("fsevents_ring_log_size", 0);
+  if (fsevents_ring_log_size) {
+    ringBuffer_ = std::make_unique<folly::LockFreeRingBuffer<FSEventsLogEntry>>(
+        fsevents_ring_log_size);
   }
-  root->inner.watch = state;
-
-  if (pipe(state->fse_pipe)) {
-    ignore_result(asprintf(
-        errmsg,
-        "watch(%s): pipe error: %s",
-        root->root_path.c_str(),
-        strerror(errno)));
-    w_log(W_LOG_ERR, "%s\n", *errmsg);
-    return false;
-  }
-  w_set_cloexec(state->fse_pipe[0]);
-  w_set_cloexec(state->fse_pipe[1]);
-  pthread_mutex_init(&state->fse_mtx, NULL);
-  pthread_cond_init(&state->fse_cond, NULL);
-
-  return true;
 }
 
-void fsevents_root_dtor(w_root_t *root) {
-  auto state = (fsevents_root_state *)root->inner.watch;
+FSEventsWatcher::~FSEventsWatcher() = default;
 
-  if (!state) {
-    return;
-  }
-
-  // wait for fsevents thread to quit
-  if (!pthread_equal(state->fse_thread, pthread_self())) {
-    void *ignore;
-    pthread_join(state->fse_thread, &ignore);
-  }
-
-  pthread_cond_destroy(&state->fse_cond);
-  pthread_mutex_destroy(&state->fse_mtx);
-  close(state->fse_pipe[0]);
-  close(state->fse_pipe[1]);
-
-  while (state->fse_head) {
-    struct watchman_fsevent *evt = state->fse_head;
-    state->fse_head = evt->next;
-
-    w_string_delref(evt->path);
-    free(evt);
-  }
-
-  free(state);
-  root->inner.watch = NULL;
-}
-
-static void fsevents_root_signal_threads(w_root_t *root) {
-  auto state = (fsevents_root_state *)root->inner.watch;
-
-  write(state->fse_pipe[1], "X", 1);
-}
-
-static bool fsevents_root_start(w_root_t *root) {
-  int err;
-  auto state = (fsevents_root_state *)root->inner.watch;
-
+bool FSEventsWatcher::start(const std::shared_ptr<watchman_root>& root) {
   // Spin up the fsevents processing thread; it owns a ref on the root
-  w_root_addref(root);
 
-  // Acquire the mutex so thread initialization waits until we release it
-  pthread_mutex_lock(&state->fse_mtx);
+  auto self = std::dynamic_pointer_cast<FSEventsWatcher>(shared_from_this());
+  try {
+    // Acquire the mutex so thread initialization waits until we release it
+    auto wlock = items_.lock();
 
-  err = pthread_create(&state->fse_thread, NULL, fsevents_thread, root);
-  if (err == 0) {
+    std::thread thread([self, root]() {
+      try {
+        self->FSEventsThread(root);
+      } catch (const std::exception& e) {
+        watchman::log(watchman::ERR, "uncaught exception: ", e.what());
+        if (!self->subdir) {
+          root->cancel();
+        }
+      }
+
+      // Ensure that we signal the condition variable before we
+      // finish this thread.  That ensures that don't get stuck
+      // waiting in FSEventsWatcher::start if something unexpected happens.
+      self->fse_cond.notify_one();
+    });
+    // We have to detach because the readChangesThread may wind up
+    // being the last thread to reference the watcher state and
+    // cannot join itself.
+    thread.detach();
+
     // Allow thread init to proceed; wait for its signal
-    pthread_cond_wait(&state->fse_cond, &state->fse_mtx);
-    pthread_mutex_unlock(&state->fse_mtx);
+    fse_cond.wait(wlock.as_lock());
 
     if (root->failure_reason) {
-      w_log(
-          W_LOG_ERR,
-          "failed to start fsevents thread: %s\n",
-          root->failure_reason.c_str());
+      logf(ERR, "failed to start fsevents thread: {}\n", root->failure_reason);
       return false;
     }
+
     return true;
+  } catch (const std::exception& e) {
+    watchman::log(
+        watchman::ERR, "failed to start fsevents thread: ", e.what(), "\n");
+    return false;
+  }
+}
+
+folly::SemiFuture<folly::Unit> FSEventsWatcher::flushPendingEvents() {
+  auto [p, f] = folly::makePromiseContract<folly::Unit>();
+
+  /*
+   * Here is our understanding of the FSEvents data flow as of June 2021:
+   *
+   * /dev/fsevents is the interface from the kernel to userspace where change
+   * events are made available.
+   *
+   * fseventsd reads /dev/fsevents and builds an internal queue/tree that it
+   * publishes to anyone using FSEvents. FSEvents holds onto that information
+   * for a bit (with the configurable delay), coalesces when it can, and then
+   * calls your callback. Importantly, while /dev/fsevents is presumed to
+   * provide some sort of sequencing, fseventsd does not offer sequencing
+   * guarantees to your callback.
+   *
+   * All FSEventStreamFlushSync is documented to do is flush any pending events
+   * inside FSEvents/fseventsd. It will call your callback repeatedly until no
+   * more events remain. It does not guarantee /dev/fsevents has been fully
+   * drained.
+   *
+   * Indeed, FSEventFlushStream alone is not sufficient. A prior attempt to
+   * avoid cookie synchronization entirely on macOS did not work.
+   *
+   * My assumption here is that /dev/fsevents is ordered, and so if we've
+   * observed a cookie _at all_ in FSEvents, FSEvents has observed every event
+   * prior to the cookie. But that does not mean all of those events have been
+   * reported to watchman's fse_callback function.
+   *
+   * Calling FSEventStreamFlushSync after the cookie and then waiting for all
+   * queued items to be processed by InMemoryView ensures the InMemoryView is up
+   * to date at least with all changes made prior to the cookie being created.
+   */
+
+  // Ensure all events queued by FSEvents are pushed into wlock->items.
+  FSEventStreamFlushSync(stream->stream);
+
+  // Now return a Future that is fulfilled when all of the items have been
+  // processed by InMemoryView.
+  auto wlock = items_.lock();
+  wlock->syncs.push_back(std::move(p));
+  fse_cond.notify_one();
+  return std::move(f);
+}
+
+bool FSEventsWatcher::waitNotify(int timeoutms) {
+  auto wlock = items_.lock();
+  fse_cond.wait_for(wlock.as_lock(), std::chrono::milliseconds(timeoutms));
+  return !wlock->items.empty() || !wlock->syncs.empty();
+}
+
+namespace {
+bool isRootRemoved(
+    const w_string& path,
+    const w_string& root_path,
+    const std::optional<w_string>& subdir) {
+  if (subdir) {
+    return path == *subdir;
+  }
+  return path == root_path;
+}
+} // namespace
+
+Watcher::ConsumeNotifyRet FSEventsWatcher::consumeNotify(
+    const std::shared_ptr<watchman_root>& root,
+    PendingChanges& coll) {
+  char flags_label[128];
+  std::vector<std::vector<watchman_fsevent>> items;
+  std::vector<folly::Promise<folly::Unit>> syncs;
+  bool cancelSelf = false;
+
+  {
+    auto wlock = items_.lock();
+    std::swap(items, wlock->items);
+    std::swap(syncs, wlock->syncs);
   }
 
-  pthread_mutex_unlock(&state->fse_mtx);
-  w_root_delref_raw(root);
-  w_log(W_LOG_ERR, "failed to start fsevents thread: %s\n", strerror(err));
-  return false;
-}
+  auto now = std::chrono::system_clock::now();
 
-static bool fsevents_root_wait_notify(w_root_t *root, int timeoutms) {
-  auto state = (fsevents_root_state *)root->inner.watch;
-  struct timeval now, delta, target;
-  struct timespec ts;
+  for (auto& vec : items) {
+    for (auto& item : vec) {
+      w_expand_flags(kflags, item.flags, flags_label, sizeof(flags_label));
+      logf(
+          DBG,
+          "fsevents: got {} {:x} {}\n",
+          item.path,
+          item.flags,
+          flags_label);
 
-  if (timeoutms == 0 || state->fse_head) {
-    return state->fse_head ? true : false;
+      if (item.flags &
+          (kFSEventStreamEventFlagUserDropped |
+           kFSEventStreamEventFlagKernelDropped)) {
+        if (!subdir) {
+          root->scheduleRecrawl(flags_label);
+          break;
+        } else {
+          w_assert(
+              item.flags & kFSEventStreamEventFlagMustScanSubDirs,
+              "dropped events should specify kFSEventStreamEventFlagMustScanSubDirs");
+          auto reason = fmt::format("{}: {}", *subdir, flags_label);
+          root->recrawlTriggered(reason.c_str());
+        }
+      }
+
+      if (item.flags & kFSEventStreamEventFlagUnmount) {
+        logf(
+            ERR,
+            "kFSEventStreamEventFlagUnmount {}, cancel watch\n",
+            item.path);
+        cancelSelf = true;
+        break;
+      }
+
+      if ((item.flags & kFSEventStreamEventFlagItemRemoved) &&
+          isRootRemoved(item.path, root->root_path, subdir)) {
+        log(ERR, "Root directory removed, cancel watch\n");
+        cancelSelf = true;
+        break;
+      }
+
+      if (item.flags & kFSEventStreamEventFlagRootChanged) {
+        logf(
+            ERR,
+            "kFSEventStreamEventFlagRootChanged {}, cancel watch\n",
+            item.path);
+        cancelSelf = true;
+        break;
+      }
+
+      if (!has_file_watching && item.path.size() < root->root_path.size()) {
+        // The test_watch_del_all appear to trigger this?
+        log(ERR,
+            "Got an event on a directory parent to the root directory: {}?\n",
+            item.path);
+        continue;
+      }
+
+      int flags = W_PENDING_VIA_NOTIFY;
+
+      if (item.flags &
+          (kFSEventStreamEventFlagMustScanSubDirs |
+           kFSEventStreamEventFlagItemRenamed)) {
+        flags |= W_PENDING_RECURSIVE;
+      }
+
+      if (item.flags &
+          (kFSEventStreamEventFlagUserDropped |
+           kFSEventStreamEventFlagKernelDropped)) {
+        flags |= W_PENDING_IS_DESYNCED;
+      }
+
+      coll.add(item.path, now, flags);
+    }
   }
 
-  // Add timeout to current time, convert to absolute timespec
-  gettimeofday(&now, NULL);
-  delta.tv_sec = timeoutms / 1000;
-  delta.tv_usec = (timeoutms - (delta.tv_sec * 1000)) * 1000;
-  w_timeval_add(now, delta, &target);
-  w_timeval_to_timespec(target, &ts);
-
-  pthread_mutex_lock(&state->fse_mtx);
-  pthread_cond_timedwait(&state->fse_cond, &state->fse_mtx, &ts);
-  pthread_mutex_unlock(&state->fse_mtx);
-  return state->fse_head ? true : false;
-}
-
-static bool
-fsevents_root_start_watch_file(struct write_locked_watchman_root *lock,
-                               struct watchman_file *file) {
-  unused_parameter(lock);
-  unused_parameter(file);
-  return true;
-}
-
-static void
-fsevents_root_stop_watch_file(struct write_locked_watchman_root *lock,
-                              struct watchman_file *file) {
-  unused_parameter(lock);
-  unused_parameter(file);
-}
-
-static struct watchman_dir_handle *
-fsevents_root_start_watch_dir(struct write_locked_watchman_root *lock,
-                              struct watchman_dir *dir, struct timeval now,
-                              const char *path) {
-  struct watchman_dir_handle *osdir;
-
-  osdir = w_dir_open(path);
-  if (!osdir) {
-    handle_open_errno(lock, dir, now, "opendir", errno, NULL);
-    return NULL;
+  for (auto& sync : syncs) {
+    coll.addSync(std::move(sync));
   }
 
-  return osdir;
+  return {!items.empty(), cancelSelf};
 }
 
-static void
-fsevents_root_stop_watch_dir(struct write_locked_watchman_root *lock,
-                             struct watchman_dir *dir) {
-  unused_parameter(lock);
-  unused_parameter(dir);
+void FSEventsWatcher::signalThreads() {
+  write(fse_pipe.write.fd(), "X", 1);
 }
 
-struct watchman_ops fsevents_watcher = {
-  "fsevents",
-  WATCHER_HAS_PER_FILE_NOTIFICATIONS|
-    WATCHER_COALESCED_RENAME,
-  fsevents_root_init,
-  fsevents_root_start,
-  fsevents_root_dtor,
-  fsevents_root_start_watch_file,
-  fsevents_root_stop_watch_file,
-  fsevents_root_start_watch_dir,
-  fsevents_root_stop_watch_dir,
-  fsevents_root_signal_threads,
-  fsevents_root_consume_notify,
-  fsevents_root_wait_notify,
-};
+std::unique_ptr<watchman_dir_handle> FSEventsWatcher::startWatchDir(
+    const std::shared_ptr<watchman_root>&,
+    watchman_dir*,
+    const char* path) {
+  return w_dir_open(path);
+}
+
+json_ref FSEventsWatcher::getDebugInfo() {
+  json_ref events = json_null();
+  if (ringBuffer_) {
+    std::vector<FSEventsLogEntry> entries;
+
+    auto head = ringBuffer_->currentHead();
+    if (head.moveBackward()) {
+      FSEventsLogEntry entry;
+      while (ringBuffer_->tryRead(entry, head)) {
+        entries.push_back(std::move(entry));
+        if (!head.moveBackward()) {
+          break;
+        }
+      }
+    }
+    std::reverse(entries.begin(), entries.end());
+
+    events = json_array();
+    for (auto& entry : entries) {
+      json_array_append(events, entry.asJsonValue());
+    }
+  }
+  return json_object({
+      {"events", events},
+      {"total_event_count", json_integer(totalEventsSeen_.load())},
+  });
+}
+
+static RegisterWatcher<FSEventsWatcher> reg("fsevents");
 
 // A helper command to facilitate testing that we can successfully
 // resync the stream.
-static void cmd_debug_fsevents_inject_drop(struct watchman_client *client,
-                                           json_t *args) {
-  json_t *resp;
+static void cmd_debug_fsevents_inject_drop(
+    watchman_client* client,
+    const json_ref& args) {
   FSEventStreamEventId last_good;
-  struct fsevents_root_state *state;
-  struct write_locked_watchman_root lock;
-  struct unlocked_watchman_root unlocked;
 
   /* resolve the root */
   if (json_array_size(args) != 2) {
@@ -769,40 +834,36 @@ static void cmd_debug_fsevents_inject_drop(struct watchman_client *client,
     return;
   }
 
-  if (!resolve_root_or_err(client, args, 1, false, &unlocked)) {
-    return;
-  }
+  auto root = resolveRoot(client, args);
 
-  if (unlocked.root->watcher_ops != &fsevents_watcher) {
+  auto watcher = watcherFromRoot(root);
+  if (!watcher) {
     send_error_response(client, "root is not using the fsevents watcher");
-    w_root_delref(&unlocked);
     return;
   }
 
-  w_root_lock(&unlocked, "debug-fsevents-inject-drop", &lock);
-  state = (fsevents_root_state*)lock.root->inner.watch;
-
-  if (!state->attempt_resync_on_drop) {
-    w_root_unlock(&lock, &unlocked);
+  if (!watcher->attempt_resync_on_drop) {
     send_error_response(client, "fsevents_try_resync is not enabled");
-    w_root_delref(&unlocked);
     return;
   }
 
-  pthread_mutex_lock(&state->fse_mtx);
-  last_good = state->stream->last_good;
-  state->stream->inject_drop = true;
-  pthread_mutex_unlock(&state->fse_mtx);
+  {
+    auto wlock = watcher->items_.lock();
+    last_good = watcher->stream->last_good;
+    watcher->stream->inject_drop = true;
+  }
 
-  w_root_unlock(&lock, &unlocked);
-
-  resp = make_response();
-  set_prop(resp, "last_good", json_integer(last_good));
-  send_and_dispose_response(client, resp);
-  w_root_delref(&unlocked);
+  auto resp = make_response();
+  resp.set("last_good", json_integer(last_good));
+  send_and_dispose_response(client, std::move(resp));
 }
-W_CMD_REG("debug-fsevents-inject-drop", cmd_debug_fsevents_inject_drop,
-          CMD_DAEMON, w_cmd_realpath_root);
+W_CMD_REG(
+    "debug-fsevents-inject-drop",
+    cmd_debug_fsevents_inject_drop,
+    CMD_DAEMON,
+    w_cmd_realpath_root)
+
+} // namespace watchman
 
 #endif // HAVE_FSEVENTS
 

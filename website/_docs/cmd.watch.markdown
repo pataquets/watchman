@@ -1,9 +1,10 @@
 ---
-id: cmd.watch
+pageid: cmd.watch
 title: watch
 layout: docs
 section: Commands
 permalink: docs/cmd/watch.html
+redirect_from: docs/cmd/watch/
 ---
 
 Deprecated starting in version 3.1.  We recommend that clients adopt
@@ -43,7 +44,7 @@ across a process restart.
 ## Case-Insensitivity
 
 Watchman has the following level of support for case-insensitive filesystems,
-starting in version 2.9.9 on OS X only:
+starting in version 2.9.9 on macOS only:
 
  * each watched root is queried to determine if it is case-insensitive.
    This is the common default for most Mac systems running HFS+.

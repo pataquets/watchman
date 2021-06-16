@@ -2,6 +2,15 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include <folly/String.h>
+#include <folly/Synchronized.h>
+#include "Logging.h"
+#include "watchman_error_category.h"
+
+using namespace watchman;
+
+std::string watchman_state_file;
+int dont_save_state = 0;
 
 /** The state saving thread is responsible for writing out the
  * persistent information about the users watches.
@@ -13,177 +22,167 @@
  * notified of state changes.
  */
 
-static pthread_t state_saver_thread;
-static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t state_cond;
-static bool need_save = false;
+namespace {
+struct state {
+  bool needsSave{false};
+};
+folly::Synchronized<state, std::mutex> saveState;
+std::condition_variable stateCond;
+std::thread state_saver_thread;
+} // namespace
 
-static bool do_state_save(void);
+static bool do_state_save();
 
-static void *state_saver(void *unused) {
+static void state_saver() noexcept {
   bool do_save;
-  unused_parameter(unused);
 
   w_set_thread_name("statesaver");
 
   while (!w_is_stopping()) {
-    pthread_mutex_lock(&state_lock);
-    if (!need_save) {
-      pthread_cond_wait(&state_cond, &state_lock);
+    {
+      auto state = saveState.lock();
+      if (!state->needsSave) {
+        stateCond.wait(state.as_lock());
+      }
+      do_save = state->needsSave;
+      state->needsSave = false;
     }
-    do_save = need_save;
-    need_save = false;
-    pthread_mutex_unlock(&state_lock);
 
     if (do_save) {
       do_state_save();
     }
   }
-  return NULL;
 }
 
-void w_state_shutdown(void) {
-  void *result;
-
+void w_state_shutdown() {
   if (dont_save_state) {
     return;
   }
 
-  pthread_cond_signal(&state_cond);
-  pthread_join(state_saver_thread, &result);
+  stateCond.notify_one();
+  state_saver_thread.join();
 }
 
-bool w_state_load(void)
-{
-  json_t *state = NULL;
-  bool result = false;
-  json_error_t err;
-
+bool w_state_load() {
   if (dont_save_state) {
     return true;
   }
 
-  pthread_cond_init(&state_cond, NULL);
-  errno = pthread_create(&state_saver_thread, NULL, state_saver, NULL);
-  if (errno) {
-    w_log(W_LOG_FATAL, "failed to spawn state thread: %s\n", strerror(errno));
-  }
+  state_saver_thread = std::thread(state_saver);
 
-  state = json_load_file(watchman_state_file, 0, &err);
-
-  if (!state) {
-    w_log(W_LOG_ERR, "failed to parse json from %s: %s\n",
+  json_ref state;
+  try {
+    state = json_load_file(watchman_state_file.c_str(), 0);
+  } catch (const std::system_error& exc) {
+    if (exc.code() == watchman::error_code::no_such_file_or_directory) {
+      // No need to alarm anyone if we've never written a state file
+      return false;
+    }
+    logf(
+        ERR,
+        "failed to load json from {}: {}\n",
         watchman_state_file,
-        err.text);
-    goto out;
+        folly::exceptionStr(exc).toStdString());
+    return false;
+  } catch (const std::exception& exc) {
+    logf(
+        ERR,
+        "failed to parse json from {}: {}\n",
+        watchman_state_file,
+        folly::exceptionStr(exc).toStdString());
+    return false;
   }
 
   if (!w_root_load_state(state)) {
-    goto out;
+    return false;
   }
 
-  result = true;
-
-out:
-  if (state) {
-    json_decref(state);
-  }
-
-  return result;
+  return true;
 }
 
 #if defined(HAVE_MKOSTEMP) && defined(sun)
 // Not guaranteed to be defined in stdlib.h
-extern int mkostemp(char *, int);
+extern int mkostemp(char*, int);
 #endif
 
-w_stm_t w_mkstemp(char *templ)
-{
+std::unique_ptr<watchman_stream> w_mkstemp(char* templ) {
 #if defined(_WIN32)
-  char *name = _mktemp(templ);
+  char* name = _mktemp(templ);
   if (!name) {
-    return NULL;
+    return nullptr;
   }
-  return w_stm_open(name, O_RDWR|O_CLOEXEC|O_CREAT|O_TRUNC);
+  // Most annoying aspect of windows is the latency around
+  // file handle exclusivity.  We could avoid this dumb loop
+  // by implementing our own mkostemp, but this is the most
+  // expedient option for the moment.
+  for (size_t attempts = 0; attempts < 10; ++attempts) {
+    auto stm = w_stm_open(name, O_RDWR | O_CLOEXEC | O_CREAT | O_TRUNC, 0600);
+    if (stm) {
+      return stm;
+    }
+    if (errno == EACCES) {
+      /* sleep override */ std::this_thread::sleep_for(
+          std::chrono::microseconds(2000));
+      continue;
+    }
+    return nullptr;
+  }
+  return nullptr;
 #else
-  w_stm_t file;
-  int fd;
-# ifdef HAVE_MKOSTEMP
-  fd = mkostemp(templ, O_CLOEXEC);
-# else
-  fd = mkstemp(templ);
-# endif
-  if (fd != -1) {
-    w_set_cloexec(fd);
+  FileDescriptor fd;
+#ifdef HAVE_MKOSTEMP
+  fd = FileDescriptor(
+      mkostemp(templ, O_CLOEXEC), FileDescriptor::FDType::Generic);
+#else
+  fd = FileDescriptor(mkstemp(templ), FileDescriptor::FDType::Generic);
+#endif
+  if (!fd) {
+    return nullptr;
   }
+  fd.setCloExec();
 
-  file = w_stm_fdopen(fd);
-  if (!file) {
-    close(fd);
-  }
-  return file;
+  return w_stm_fdopen(std::move(fd));
 #endif
 }
 
-static bool do_state_save(void)
-{
-  json_t *state;
+static bool do_state_save() {
   w_jbuffer_t buffer;
-  w_stm_t file = NULL;
-  bool result = false;
 
-  state = json_object();
+  auto state = json_object();
 
-  if (!w_json_buffer_init(&buffer)) {
-    w_log(W_LOG_ERR, "save_state: failed to init json buffer\n");
-    goto out;
-  }
-
-  file = w_stm_open(watchman_state_file, O_WRONLY|O_TRUNC|O_CREAT, 0600);
+  auto file = w_stm_open(
+      watchman_state_file.c_str(), O_WRONLY | O_TRUNC | O_CREAT, 0600);
   if (!file) {
-    w_log(W_LOG_ERR, "save_state: unable to open %s for write: %s\n",
+    log(ERR,
+        "save_state: unable to open ",
         watchman_state_file,
-        strerror(errno));
-    goto out;
+        " for write: ",
+        folly::errnoStr(errno),
+        "\n");
+    return false;
   }
 
-  set_unicode_prop(state, "version", PACKAGE_VERSION);
+  state.set("version", typed_string_to_json(PACKAGE_VERSION, W_STRING_UNICODE));
 
   /* now ask the different subsystems to fill out the state */
   if (!w_root_save_state(state)) {
-    goto out;
+    return false;
   }
 
   /* we've prepared what we're going to save, so write it out */
-  w_json_buffer_write(&buffer, file, state, JSON_INDENT(4));
-  w_stm_close(file);
-  file = NULL;
-  result = true;
-
-out:
-  if (file) {
-    w_stm_close(file);
-  }
-  if (state) {
-    json_decref(state);
-  }
-  w_json_buffer_free(&buffer);
-
-  return result;
+  buffer.jsonEncodeToStream(state, file.get(), JSON_INDENT(4));
+  return true;
 }
 
 /** Arranges for the state to be saved.
  * Does not immediately save the state. */
-void w_state_save(void) {
+void w_state_save() {
   if (dont_save_state) {
     return;
   }
 
-  pthread_mutex_lock(&state_lock);
-  need_save = true;
-  pthread_mutex_unlock(&state_lock);
-
-  pthread_cond_signal(&state_cond);
+  saveState.lock()->needsSave = true;
+  stateCond.notify_one();
 }
 
 /* vim:ts=2:sw=2:et:

@@ -3,19 +3,20 @@
 
 #include "watchman.h"
 
-bool try_client_mode_command(json_t *cmd, bool pretty)
-{
-  struct watchman_client client;
+using namespace watchman;
+
+bool try_client_mode_command(const json_ref& cmd, bool pretty) {
+  auto client = std::make_shared<watchman_client>();
   bool res;
-  struct watchman_client_response *resp;
 
-  memset(&client, 0, sizeof(client));
-  client.client_mode = true;
-  res = dispatch_command(&client, cmd, CMD_CLIENT);
+  client->client_mode = true;
+  res = dispatch_command(client.get(), cmd, CMD_CLIENT);
 
-  resp = client.head;
-  if (resp) {
-    json_dumpf(resp->json, stdout, pretty ? JSON_INDENT(4) : JSON_COMPACT);
+  if (!client->responses.empty()) {
+    json_dumpf(
+        client->responses.front(),
+        stdout,
+        pretty ? JSON_INDENT(4) : JSON_COMPACT);
     printf("\n");
   }
 

@@ -2,181 +2,165 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
-#ifdef HAVE_LIBGIMLI_H
-# include <libgimli.h>
-#endif
+#include <folly/Exception.h>
+#include <folly/MapUtil.h>
+#include <folly/Optional.h>
+#include <folly/SocketAddress.h>
+#include <folly/String.h>
+#include <folly/Synchronized.h>
+#include <folly/net/NetworkSocket.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include "SignalHandler.h"
 
-/* This needs to be recursive safe because we may log to clients
- * while we are dispatching subscriptions to clients */
-pthread_mutex_t w_client_lock;
-w_ht_t *clients = NULL;
-static int listener_fd = -1;
-pthread_t reaper_thread;
-static pthread_t listener_thread;
-#ifdef _WIN32
-static HANDLE listener_thread_event;
-#endif
-static volatile bool stopping = false;
-#ifdef HAVE_LIBGIMLI_H
-static volatile struct gimli_heartbeat *hb = NULL;
-#endif
+using namespace watchman;
 
-bool w_is_stopping(void) {
-  return stopping;
+folly::Synchronized<std::unordered_set<std::shared_ptr<watchman_client>>>
+    clients;
+static FileDescriptor listener_fd;
+static std::vector<std::shared_ptr<watchman_event>> listener_thread_events;
+static std::atomic<bool> stopping = false;
+static constexpr size_t kResponseLogLimit = 8;
+
+bool w_is_stopping() {
+  return stopping.load(std::memory_order_relaxed);
 }
 
-void w_client_lock_init(void) {
-  pthread_mutexattr_t mattr;
+json_ref make_response() {
+  auto resp = json_object();
 
-  pthread_mutexattr_init(&mattr);
-  pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
-  pthread_mutex_init(&w_client_lock, &mattr);
-  pthread_mutexattr_destroy(&mattr);
-}
-
-json_t *make_response(void)
-{
-  json_t *resp = json_object();
-
-  set_unicode_prop(resp, "version", PACKAGE_VERSION);
+  resp.set("version", typed_string_to_json(PACKAGE_VERSION, W_STRING_UNICODE));
 
   return resp;
 }
 
-/* must be called with the w_client_lock held */
-bool enqueue_response(struct watchman_client *client,
-    json_t *json, bool ping)
-{
-  struct watchman_client_response *resp;
-
-  resp = (watchman_client_response*)calloc(1, sizeof(*resp));
-  if (!resp) {
-    return false;
-  }
-  resp->json = json;
-
-  if (client->tail) {
-    client->tail->next = resp;
-  } else {
-    client->head = resp;
-  }
-  client->tail = resp;
-
-  if (ping) {
-    w_event_set(client->ping);
-  }
-
-  return true;
+void send_and_dispose_response(
+    struct watchman_client* client,
+    json_ref&& response) {
+  client->enqueueResponse(std::move(response), false);
 }
 
-void send_and_dispose_response(struct watchman_client *client,
-    json_t *response)
-{
-  pthread_mutex_lock(&w_client_lock);
-  if (!enqueue_response(client, response, false)) {
-    json_decref(response);
-  }
-  pthread_mutex_unlock(&w_client_lock);
-}
-
-void send_error_response(struct watchman_client *client,
-    const char *fmt, ...)
-{
-  char buf[WATCHMAN_NAME_MAX];
+void send_error_response(struct watchman_client* client, const char* fmt, ...) {
   va_list ap;
-  json_t *resp = make_response();
-  json_t *errstr;
 
   va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
+  auto errorText = w_string::vprintf(fmt, ap);
   va_end(ap);
 
-  errstr = typed_string_to_json(buf, W_STRING_MIXED);
-  set_prop(resp, "error", errstr);
+  auto resp = make_response();
+  resp.set("error", w_string_to_json(errorText));
 
-  json_incref(errstr);
   if (client->perf_sample) {
-    client->perf_sample->add_meta("error", errstr);
+    client->perf_sample->add_meta("error", w_string_to_json(errorText));
   }
 
   if (client->current_command) {
-    char *command = NULL;
-    command = json_dumps(client->current_command, 0);
-    w_log(W_LOG_ERR, "send_error_response: %s failed: %s\n",
-        command, buf);
-    free(command);
+    auto command = json_dumps(client->current_command, 0);
+    watchman::log(
+        watchman::ERR,
+        "send_error_response: ",
+        command,
+        ", failed: ",
+        errorText,
+        "\n");
   } else {
-    w_log(W_LOG_ERR, "send_error_response: %s\n", buf);
+    watchman::log(watchman::ERR, "send_error_response: ", errorText, "\n");
   }
 
-  send_and_dispose_response(client, resp);
+  send_and_dispose_response(client, std::move(resp));
 }
 
-static void client_delete(struct watchman_client *client)
-{
-  struct watchman_client_response *resp;
+namespace {
+// TODO: If used in a hot loop, EdenFS has a faster implementation.
+// https://github.com/facebookexperimental/eden/blob/c745d644d969dae1e4c0d184c19320fac7c27ae5/eden/fs/utils/IDGen.h
+std::atomic<uint64_t> id_generator{1};
+} // namespace
 
-  w_log(W_LOG_DBG, "client_delete %p\n", client);
-  derived_client_dtor(client);
+watchman_client::watchman_client() : watchman_client(nullptr) {}
 
-  while (client->head) {
-    resp = client->head;
-    client->head = resp->next;
-    json_decref(resp->json);
-    free(resp);
-  }
-
-  w_json_buffer_free(&client->reader);
-  w_json_buffer_free(&client->writer);
-  w_event_destroy(client->ping);
-  w_stm_shutdown(client->stm);
-  w_stm_close(client->stm);
-  free(client);
-}
-
-void w_request_shutdown(void) {
-  stopping = true;
-// Knock listener thread out of poll/accept
-#ifndef _WIN32
-  pthread_kill(listener_thread, SIGUSR1);
-  pthread_kill(reaper_thread, SIGUSR1);
+watchman_client::watchman_client(std::unique_ptr<watchman_stream>&& stm)
+    : unique_id{id_generator++},
+      stm(std::move(stm)),
+      ping(
+#ifdef _WIN32
+          (this->stm &&
+           this->stm->getFileDescriptor().fdType() ==
+               FileDescriptor::FDType::Socket)
+              ? w_event_make_sockets()
+              : w_event_make_named_pipe()
 #else
-  SetEvent(listener_thread_event);
+          w_event_make_sockets()
 #endif
+
+      ) {
+  logf(DBG, "accepted client:stm={}\n", fmt::ptr(this->stm.get()));
+}
+
+watchman_client::~watchman_client() {
+  debugSub.reset();
+  errorSub.reset();
+
+  logf(DBG, "client_delete {}\n", unique_id);
+
+  if (stm) {
+    stm->shutdown();
+  }
+}
+
+void watchman_client::enqueueResponse(json_ref&& resp, bool ping) {
+  responses.emplace_back(std::move(resp));
+
+  if (ping) {
+    this->ping->notify();
+  }
+}
+
+void w_request_shutdown() {
+  stopping.store(true, std::memory_order_relaxed);
+  // Knock listener thread out of poll/accept
+  for (auto& evt : listener_thread_events) {
+    evt->notify();
+  }
 }
 
 // The client thread reads and decodes json packets,
 // then dispatches the commands that it finds
-static void *client_thread(void *ptr)
-{
-  auto client = (watchman_client*)ptr;
+static void client_thread(
+    std::shared_ptr<watchman_user_client> client) noexcept {
+  // Keep a persistent vector around so that we can avoid allocating
+  // and releasing heap memory when we collect items from the publisher
+  std::vector<std::shared_ptr<const watchman::Publisher::Item>> pending;
+
+  client->stm->setNonBlock(true);
+  w_set_thread_name(
+      "client=",
+      client->unique_id,
+      ":stm=",
+      uintptr_t(client->stm.get()),
+      ":pid=",
+      client->stm->getPeerProcessID());
+
+  client->client_is_owner = client->stm->peerIsOwner();
+
   struct watchman_event_poll pfd[2];
-  struct watchman_client_response *queued_responses_to_send;
-  json_t *request;
-  json_error_t jerr;
-  bool send_ok = true;
+  pfd[0].evt = client->stm->getEvents();
+  pfd[1].evt = client->ping.get();
 
-  w_stm_set_nonblock(client->stm, true);
-  w_set_thread_name("client=%p:stm=%p", client, client->stm);
-
-  client->client_is_owner = w_stm_peer_is_owner(client->stm);
-
-  w_stm_get_events(client->stm, &pfd[0].evt);
-  pfd[1].evt = client->ping;
-
-  while (!stopping) {
+  bool client_alive = true;
+  while (!w_is_stopping() && client_alive) {
     // Wait for input from either the client socket or
     // via the ping pipe, which signals that some other
     // thread wants to unilaterally send data to the client
 
     ignore_result(w_poll_events(pfd, 2, 2000));
-
-    if (stopping) {
+    if (w_is_stopping()) {
       break;
     }
 
     if (pfd[0].ready) {
-      request = w_json_buffer_next(&client->reader, client->stm, &jerr);
+      json_error_t jerr;
+      auto request = client->reader.decodeNext(client->stm.get(), &jerr);
 
       if (!request && errno == EAGAIN) {
         // That's fine
@@ -187,137 +171,173 @@ static void *client_thread(void *ptr)
           // any error
           goto disconnected;
         }
-        send_error_response(client, "invalid json at position %d: %s",
-            jerr.position, jerr.text);
-        w_log(W_LOG_ERR, "invalid data from client: %s\n", jerr.text);
+        send_error_response(
+            client.get(),
+            "invalid json at position %d: %s",
+            jerr.position,
+            jerr.text);
+        logf(ERR, "invalid data from client: {}\n", jerr.text);
 
         goto disconnected;
       } else if (request) {
         client->pdu_type = client->reader.pdu_type;
-        dispatch_command(client, request, CMD_DAEMON);
-        json_decref(request);
+        client->capabilities = client->reader.capabilities;
+        dispatch_command(client.get(), request, CMD_DAEMON);
       }
     }
 
     if (pfd[1].ready) {
-      w_event_test_and_clear(client->ping);
-    }
+      while (client->ping->testAndClear()) {
+        // Enqueue refs to pending log payloads
+        pending.clear();
+        getPending(pending, client->debugSub, client->errorSub);
+        for (auto& item : pending) {
+          client->enqueueResponse(json_ref(item->payload), false);
+        }
 
-    /* de-queue the pending responses under the lock */
-    pthread_mutex_lock(&w_client_lock);
-    queued_responses_to_send = client->head;
-    client->head = NULL;
-    client->tail = NULL;
-    pthread_mutex_unlock(&w_client_lock);
+        // Maybe we have subscriptions to dispatch?
+        std::vector<w_string> subsToDelete;
+        for (auto& subiter : client->unilateralSub) {
+          auto sub = subiter.first;
+          auto subStream = subiter.second;
 
-    /* now send our response(s) */
-    while (queued_responses_to_send) {
-      struct watchman_client_response *response_to_send =
-        queued_responses_to_send;
+          watchman::log(
+              watchman::DBG, "consider fan out sub ", sub->name, "\n");
 
-      if (send_ok) {
-        w_stm_set_nonblock(client->stm, false);
-        /* Return the data in the same format that was used to ask for it.
-         * Don't bother sending any more messages if the client disconnects,
-         * but still free their memory.
-         */
-        send_ok = w_ser_write_pdu(client->pdu_type, &client->writer,
-                                  client->stm, response_to_send->json);
-        w_stm_set_nonblock(client->stm, true);
-      }
+          pending.clear();
+          subStream->getPending(pending);
+          bool seenSettle = false;
+          for (auto& item : pending) {
+            auto dumped = json_dumps(item->payload, 0);
+            watchman::log(
+                watchman::DBG,
+                "Unilateral payload for sub ",
+                sub->name,
+                " ",
+                dumped,
+                "\n");
 
-      queued_responses_to_send = response_to_send->next;
+            if (item->payload.get_default("canceled")) {
+              watchman::log(
+                  watchman::ERR,
+                  "Cancel subscription ",
+                  sub->name,
+                  " due to root cancellation\n");
 
-      json_decref(response_to_send->json);
-      free(response_to_send);
-    }
-  }
+              auto resp = make_response();
+              resp.set(
+                  {{"root", item->payload.get_default("root")},
+                   {"unilateral", json_true()},
+                   {"canceled", json_true()},
+                   {"subscription", w_string_to_json(sub->name)}});
+              client->enqueueResponse(std::move(resp), false);
+              // Remember to cancel this subscription.
+              // We can't do it in this loop because that would
+              // invalidate the iterators and cause a headache.
+              subsToDelete.push_back(sub->name);
+              continue;
+            }
 
-disconnected:
-  w_set_thread_name("NOT_CONN:client=%p:stm=%p", client, client->stm);
-  // Remove the client from the map before we tear it down, as this makes
-  // it easier to flush out pending writes on windows without worrying
-  // about w_log_to_clients contending for the write buffers
-  pthread_mutex_lock(&w_client_lock);
-  w_ht_del(clients, w_ht_ptr_val(client));
-  pthread_mutex_unlock(&w_client_lock);
+            if (item->payload.get_default("state-enter") ||
+                item->payload.get_default("state-leave")) {
+              auto resp = make_response();
+              json_object_update(item->payload, resp);
+              // We have the opportunity to populate additional response
+              // fields here (since we don't want to block the command).
+              // We don't populate the fat clock for SCM aware queries
+              // because determination of mergeBase could add latency.
+              resp.set(
+                  {{"unilateral", json_true()},
+                   {"subscription", w_string_to_json(sub->name)}});
+              client->enqueueResponse(std::move(resp), false);
 
-  client_delete(client);
+              watchman::log(
+                  watchman::DBG,
+                  "Fan out subscription state change for ",
+                  sub->name,
+                  "\n");
+              continue;
+            }
 
-  return NULL;
-}
+            if (!sub->debug_paused && item->payload.get_default("settled")) {
+              seenSettle = true;
+              continue;
+            }
+          }
 
-bool w_should_log_to_clients(int level)
-{
-  w_ht_iter_t iter;
-  bool result = false;
+          if (seenSettle) {
+            sub->processSubscription();
+          }
+        }
 
-  pthread_mutex_lock(&w_client_lock);
-
-  if (!clients) {
-    pthread_mutex_unlock(&w_client_lock);
-    return false;
-  }
-
-  if (w_ht_first(clients, &iter)) do {
-    auto client = (watchman_client *)w_ht_val_ptr(iter.value);
-
-    if (client->log_level != W_LOG_OFF && client->log_level >= level) {
-      result = true;
-      break;
-    }
-
-  } while (w_ht_next(clients, &iter));
-  pthread_mutex_unlock(&w_client_lock);
-
-  return result;
-}
-
-void w_log_to_clients(int level, const char *buf)
-{
-  json_t *json = NULL;
-  w_ht_iter_t iter;
-
-  if (!clients) {
-    return;
-  }
-
-  pthread_mutex_lock(&w_client_lock);
-  if (w_ht_first(clients, &iter)) do {
-    auto client = (watchman_client *)w_ht_val_ptr(iter.value);
-
-    if (client->log_level != W_LOG_OFF && client->log_level >= level) {
-      json = make_response();
-      if (json) {
-        set_mixed_string_prop(json, "log", buf);
-        set_prop(json, "unilateral", json_true());
-        if (!enqueue_response(client, json, true)) {
-          json_decref(json);
+        for (auto& name : subsToDelete) {
+          client->unsubByName(name);
         }
       }
     }
 
-  } while (w_ht_next(clients, &iter));
-  pthread_mutex_unlock(&w_client_lock);
+    /* now send our response(s) */
+    while (!client->responses.empty() && client_alive) {
+      auto& response_to_send = client->responses.front();
+
+      client->stm->setNonBlock(false);
+      /* Return the data in the same format that was used to ask for it.
+       * Update client liveness based on send success.
+       */
+      client_alive = client->writer.pduEncodeToStream(
+          client->pdu_type,
+          client->capabilities,
+          response_to_send,
+          client->stm.get());
+      client->stm->setNonBlock(true);
+
+      json_ref subscriptionValue = response_to_send.get_default("subscription");
+      if (subscriptionValue && subscriptionValue.isString() &&
+          json_string_value(subscriptionValue)) {
+        auto subscriptionName = json_to_w_string(subscriptionValue);
+        if (auto* sub =
+                folly::get_ptr(client->subscriptions, subscriptionName)) {
+          if ((*sub)->lastResponses.size() >= kResponseLogLimit) {
+            (*sub)->lastResponses.pop_front();
+          }
+          (*sub)->lastResponses.push_back(
+              watchman_client_subscription::LoggedResponse{
+                  std::chrono::system_clock::now(), response_to_send});
+        }
+      }
+
+      client->responses.pop_front();
+    }
+  }
+
+disconnected:
+  w_set_thread_name(
+      "NOT_CONN:client=",
+      client->unique_id,
+      ":stm=",
+      uintptr_t(client->stm.get()),
+      ":pid=",
+      client->stm->getPeerProcessID());
+  // Remove the client from the map before we tear it down, as this makes
+  // it easier to flush out pending writes on windows without worrying
+  // about w_log_to_clients contending for the write buffers
+  clients.wlock()->erase(client);
 }
 
 // This is just a placeholder.
 // This catches SIGUSR1 so we don't terminate.
 // We use this to interrupt blocking syscalls
 // on the worker threads
-static void wakeme(int signo)
-{
-  unused_parameter(signo);
-}
+static void wakeme(int) {}
 
 #if defined(HAVE_KQUEUE) || defined(HAVE_FSEVENTS)
 #ifdef __OpenBSD__
 #include <sys/siginfo.h>
 #endif
 #include <sys/param.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
-#include <sys/resource.h>
 #endif
 
 #ifndef _WIN32
@@ -326,343 +346,466 @@ static void wakeme(int signo)
 // to move the inetd provided socket descriptor(s) to a new descriptor
 // number and remember that we can just use these when we're starting
 // up the listener.
-bool w_listener_prep_inetd(void) {
-  if (listener_fd != -1) {
-    w_log(W_LOG_ERR,
-          "w_listener_prep_inetd: listener_fd is already assigned\n");
-    return false;
+void w_listener_prep_inetd() {
+  if (listener_fd) {
+    throw std::runtime_error(
+        "w_listener_prep_inetd: listener_fd is already assigned");
   }
 
-  listener_fd = dup(STDIN_FILENO);
-  if (listener_fd == -1) {
-    w_log(W_LOG_ERR, "w_listener_prep_inetd: failed to dup stdin: %s\n",
-          strerror(errno));
-    return false;
-  }
-
-  return true;
+  listener_fd = FileDescriptor(
+      dup(STDIN_FILENO),
+      "dup(stdin) for listener",
+      // It's probably a socket but we don't know for sure
+      FileDescriptor::FDType::Unknown);
 }
 
-static int get_listener_socket(const char *path)
-{
-  struct sockaddr_un un;
-  mode_t perms = cfg_get_perms(NULL, "sock_access",
-                               true /* write bits */,
-                               false /* execute bits */);
+#endif
 
-  if (listener_fd != -1) {
-    // Assume that it was prepped by w_listener_prep_inetd()
-    w_log(W_LOG_ERR, "Using socket from inetd as listening socket\n");
-    return listener_fd;
-  }
+static FileDescriptor get_listener_tcp_socket() {
+  FileDescriptor listener_fd;
+
+  folly::SocketAddress addr;
+  addr.setFromHostPort(
+      Configuration().getString("tcp-listener-address", nullptr));
+
+  listener_fd = FileDescriptor(
+      ::socket(addr.getFamily(), SOCK_STREAM, 0),
+      "socket() for TCP socket",
+      FileDescriptor::FDType::Socket);
+
+  int one = 1;
+  ::setsockopt(
+      listener_fd.system_handle(),
+      SOL_SOCKET,
+      SO_REUSEADDR,
+      (char*)&one,
+      sizeof(one));
+  // Most of our TCP transactions are quite small, so this seems appropriate
+  ::setsockopt(
+      listener_fd.system_handle(),
+      IPPROTO_TCP,
+      TCP_NODELAY,
+      (char*)&one,
+      sizeof(one));
+
+  sockaddr_storage storage;
+  auto addrLen = addr.getAddress(&storage);
+
+  folly::checkUnixError(
+      ::bind(listener_fd.system_handle(), (struct sockaddr*)&storage, addrLen),
+      "bind to ",
+      addr.getAddressStr(),
+      "failed");
+
+  folly::checkUnixError(
+      ::listen(listener_fd.system_handle(), 200),
+      "listen on ",
+      addr.getAddressStr(),
+      "failed");
+
+  addr.setFromLocalAddress(folly::NetworkSocket(listener_fd.system_handle()));
+  log(ERR, "Started TCP listener on ", addr.describe(), "\n");
+
+  return listener_fd;
+}
+
+static FileDescriptor get_listener_unix_domain_socket(const char* path) {
+  struct sockaddr_un un {};
+
+#ifndef _WIN32
+  mode_t perms = cfg_get_perms(
+      "sock_access", true /* write bits */, false /* execute bits */);
+#endif
+  FileDescriptor listener_fd;
 
 #ifdef __APPLE__
   listener_fd = w_get_listener_socket_from_launchd();
-  if (listener_fd != -1) {
-    w_log(W_LOG_ERR, "Using socket from launchd as listening socket\n");
+  if (listener_fd) {
+    logf(ERR, "Using socket from launchd as listening socket\n");
     return listener_fd;
   }
 #endif
 
   if (strlen(path) >= sizeof(un.sun_path) - 1) {
-    w_log(W_LOG_ERR, "%s: path is too long\n",
-        path);
-    return -1;
+    logf(ERR, "{}: path is too long\n", path);
+    return FileDescriptor();
   }
 
-  listener_fd = socket(PF_LOCAL, SOCK_STREAM, 0);
-  if (listener_fd == -1) {
-    w_log(W_LOG_ERR, "socket: %s\n",
-        strerror(errno));
-    return -1;
-  }
+  listener_fd = FileDescriptor(
+      ::socket(PF_LOCAL, SOCK_STREAM, 0),
+      "socket",
+      FileDescriptor::FDType::Socket);
 
   un.sun_family = PF_LOCAL;
-  strcpy(un.sun_path, path);
+  memcpy(un.sun_path, path, strlen(path) + 1);
   unlink(path);
 
-  if (bind(listener_fd, (struct sockaddr*)&un, sizeof(un)) != 0) {
-    w_log(W_LOG_ERR, "bind(%s): %s\n",
-      path, strerror(errno));
-    close(listener_fd);
-    return -1;
+  if (::bind(listener_fd.system_handle(), (struct sockaddr*)&un, sizeof(un)) !=
+      0) {
+    logf(ERR, "bind({}): {}\n", path, folly::errnoStr(errno));
+    return FileDescriptor();
   }
 
+#ifndef _WIN32
   // The permissions in the containing directory should be correct, so this
   // should be correct as well. But set the permissions in any case.
   if (chmod(path, perms) == -1) {
-    w_log(W_LOG_ERR, "chmod(%s, %#o): %s", path, perms, strerror(errno));
-    close(listener_fd);
-    return -1;
+    logf(ERR, "chmod({}, {:o}): {}", path, perms, folly::errnoStr(errno));
+    return FileDescriptor();
   }
 
-  if (listen(listener_fd, 200) != 0) {
-    w_log(W_LOG_ERR, "listen(%s): %s\n",
-        path, strerror(errno));
-    close(listener_fd);
-    return -1;
+  // Double-check that the socket has the right permissions. This can happen
+  // when the containing directory was created in a previous run, with a group
+  // the user is no longer in.
+  struct stat st;
+  if (lstat(path, &st) == -1) {
+    watchman::log(
+        watchman::ERR, "lstat(", path, "): ", folly::errnoStr(errno), "\n");
+    return FileDescriptor();
+  }
+
+  // This is for testing only
+  // (test_sock_perms.py:test_user_previously_in_sock_group). Do not document.
+  const char* sock_group_name = cfg_get_string("__sock_file_group", nullptr);
+  if (!sock_group_name) {
+    sock_group_name = cfg_get_string("sock_group", nullptr);
+  }
+
+  if (sock_group_name) {
+    const struct group* sock_group = w_get_group(sock_group_name);
+    if (!sock_group) {
+      return FileDescriptor();
+    }
+    if (st.st_gid != sock_group->gr_gid) {
+      watchman::log(
+          watchman::ERR,
+          "for socket '",
+          path,
+          "', gid ",
+          st.st_gid,
+          " doesn't match expected gid ",
+          sock_group->gr_gid,
+          " (group name ",
+          sock_group_name,
+          "). Ensure that you are still a member of group ",
+          sock_group_name,
+          ".\n");
+      return FileDescriptor();
+    }
+  }
+#endif
+
+  if (::listen(listener_fd.system_handle(), 200) != 0) {
+    logf(ERR, "listen({}): {}\n", path, folly::errnoStr(errno));
+    return FileDescriptor();
   }
 
   return listener_fd;
 }
-#endif
 
-static struct watchman_client *make_new_client(w_stm_t stm) {
-  pthread_attr_t attr;
+static std::shared_ptr<watchman_client> make_new_client(
+    std::unique_ptr<watchman_stream>&& stm) {
+  auto client = std::make_shared<watchman_user_client>(std::move(stm));
 
-  pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-  auto client = (watchman_client*)calloc(1, derived_client_size);
-  if (!client) {
-    pthread_attr_destroy(&attr);
-    return NULL;
-  }
-  client->stm = stm;
-  w_log(W_LOG_DBG, "accepted client:stm=%p\n", client->stm);
-
-  if (!w_json_buffer_init(&client->reader)) {
-    // FIXME: error handling
-  }
-  if (!w_json_buffer_init(&client->writer)) {
-    // FIXME: error handling
-  }
-  client->ping = w_event_make();
-  if (!client->ping) {
-    // FIXME: error handling
-  }
-
-  derived_client_ctor(client);
-
-  pthread_mutex_lock(&w_client_lock);
-  w_ht_set(clients, w_ht_ptr_val(client), w_ht_ptr_val(client));
-  pthread_mutex_unlock(&w_client_lock);
+  clients.wlock()->insert(client);
 
   // Start a thread for the client.
   // We used to use libevent for this, but we have
   // a low volume of concurrent clients and the json
   // parse/encode APIs are not easily used in a non-blocking
   // server architecture.
-  if (pthread_create(&client->thread_handle, &attr, client_thread, client)) {
-    // It didn't work out, sorry!
-    pthread_mutex_lock(&w_client_lock);
-    w_ht_del(clients, w_ht_ptr_val(client));
-    pthread_mutex_unlock(&w_client_lock);
-    client_delete(client);
-  }
+  try {
+    std::thread thr([client] { client_thread(client); });
 
-  pthread_attr_destroy(&attr);
+    thr.detach();
+  } catch (const std::exception&) {
+    clients.wlock()->erase(client);
+    throw;
+  }
 
   return client;
 }
 
 #ifdef _WIN32
-static void named_pipe_accept_loop(const char *path) {
+
+static FileDescriptor create_pipe_server(const char* path) {
+  return FileDescriptor(
+      intptr_t(CreateNamedPipe(
+          path,
+          PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+          PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
+          PIPE_UNLIMITED_INSTANCES,
+          WATCHMAN_IO_BUF_SIZE,
+          512,
+          0,
+          nullptr)),
+      FileDescriptor::FDType::Pipe);
+}
+
+static void named_pipe_accept_loop_internal(
+    std::shared_ptr<watchman_event> listener_event) {
   HANDLE handles[2];
-  OVERLAPPED olap;
+  auto olap = OVERLAPPED();
   HANDLE connected_event = CreateEvent(NULL, FALSE, TRUE, NULL);
+  auto path = get_named_pipe_sock_path();
 
   if (!connected_event) {
-    w_log(W_LOG_ERR, "named_pipe_accept_loop: CreateEvent failed: %s\n",
+    logf(
+        ERR,
+        "named_pipe_accept_loop_internal: CreateEvent failed: {}\n",
         win32_strerror(GetLastError()));
     return;
   }
 
-  listener_thread_event = CreateEvent(NULL, FALSE, TRUE, NULL);
-
   handles[0] = connected_event;
-  handles[1] = listener_thread_event;
-  memset(&olap, 0, sizeof(olap));
+  handles[1] = (HANDLE)listener_event->system_handle();
   olap.hEvent = connected_event;
 
-  w_log(W_LOG_ERR, "waiting for pipe clients on %s\n", path);
-  while (!stopping) {
-    w_stm_t stm;
-    HANDLE client_fd;
+  logf(ERR, "waiting for pipe clients on {}\n", get_named_pipe_sock_path());
+  while (!w_is_stopping()) {
+    FileDescriptor client_fd;
     DWORD res;
 
-    client_fd = CreateNamedPipe(
-        path,
-        PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|
-        PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_UNLIMITED_INSTANCES,
-        WATCHMAN_IO_BUF_SIZE,
-        512, 0, NULL);
-
-    if (client_fd == INVALID_HANDLE_VALUE) {
-      w_log(W_LOG_ERR, "CreateNamedPipe(%s) failed: %s\n",
-          path, win32_strerror(GetLastError()));
+    client_fd = create_pipe_server(path.c_str());
+    if (!client_fd) {
+      logf(
+          ERR,
+          "CreateNamedPipe(%s) failed: %s\n",
+          path,
+          win32_strerror(GetLastError()));
       continue;
     }
 
     ResetEvent(connected_event);
-    if (!ConnectNamedPipe(client_fd, &olap)) {
+    if (!ConnectNamedPipe((HANDLE)client_fd.handle(), &olap)) {
       res = GetLastError();
 
       if (res == ERROR_PIPE_CONNECTED) {
-        goto good_client;
+        make_new_client(w_stm_fdopen(std::move(client_fd)));
+        continue;
       }
 
       if (res != ERROR_IO_PENDING) {
-        w_log(W_LOG_ERR, "ConnectNamedPipe: %s\n",
-            win32_strerror(GetLastError()));
-        CloseHandle(client_fd);
+        logf(ERR, "ConnectNamedPipe: {}\n", win32_strerror(GetLastError()));
         continue;
       }
 
       res = WaitForMultipleObjectsEx(2, handles, false, INFINITE, true);
       if (res == WAIT_OBJECT_0 + 1) {
         // Signalled to stop
-        CancelIoEx(client_fd, &olap);
-        CloseHandle(client_fd);
+        CancelIoEx((HANDLE)client_fd.handle(), &olap);
         continue;
       }
 
-      if (res == WAIT_OBJECT_0) {
-        goto good_client;
-      }
-
-      w_log(W_LOG_ERR, "WaitForMultipleObjectsEx: ConnectNamedPipe: "
-          "unexpected status %u\n", res);
-      CancelIoEx(client_fd, &olap);
-      CloseHandle(client_fd);
-    } else {
-good_client:
-      stm = w_stm_handleopen(client_fd);
-      if (!stm) {
-        w_log(W_LOG_ERR, "Failed to allocate stm for pipe handle: %s\n",
-            strerror(errno));
-        CloseHandle(client_fd);
+      if (res != WAIT_OBJECT_0) {
+        logf(
+            ERR,
+            "WaitForMultipleObjectsEx: ConnectNamedPipe: "
+            "unexpected status {}\n",
+            res);
+        CancelIoEx((HANDLE)client_fd.handle(), &olap);
         continue;
       }
-
-      make_new_client(stm);
     }
+    make_new_client(w_stm_fdopen(std::move(client_fd)));
+  }
+  logf(ERR, "is_stopping is true, so acceptor is done\n");
+}
+
+static void named_pipe_accept_loop() {
+  log(DBG, "Starting pipe listener on ", get_named_pipe_sock_path(), "\n");
+
+  std::vector<std::thread> acceptors;
+  std::shared_ptr<watchman_event> listener_event(w_event_make_named_pipe());
+
+  listener_thread_events.push_back(listener_event);
+
+  for (json_int_t i = 0; i < cfg_get_int("win32_concurrent_accepts", 32); ++i) {
+    acceptors.push_back(std::thread([i, listener_event]() {
+      w_set_thread_name("accept", i);
+      named_pipe_accept_loop_internal(listener_event);
+    }));
+  }
+  for (auto& thr : acceptors) {
+    thr.join();
   }
 }
 #endif
 
-#ifndef _WIN32
-static void accept_loop() {
-  while (!stopping) {
-    int client_fd;
-    struct pollfd pfd;
-    int bufsize;
-    w_stm_t stm;
+/** A helper for owning and running a socket-style (rather than
+ * named pipe style) accept loop that runs in another thread.
+ */
+class AcceptLoop {
+  std::thread thread_;
+  bool joined_{false};
 
-#ifdef HAVE_LIBGIMLI_H
-    if (hb) {
-      gimli_heartbeat_set(hb, GIMLI_HB_RUNNING);
-    }
-#endif
+  static void accept_thread(
+      FileDescriptor&& listenerDescriptor,
+      std::shared_ptr<watchman_event> listener_event) {
+    auto listener = w_stm_fdopen(std::move(listenerDescriptor));
+    while (!w_is_stopping()) {
+      FileDescriptor client_fd;
+      struct watchman_event_poll pfd[2];
+      int bufsize;
 
-    pfd.events = POLLIN;
-    pfd.fd = listener_fd;
-    if (poll(&pfd, 1, 60000) < 1 || (pfd.revents & POLLIN) == 0) {
-      if (stopping) {
+      pfd[0].evt = listener->getEvents();
+      pfd[1].evt = listener_event.get();
+
+      if (w_poll_events(pfd, 2, 60000) == 0) {
+        if (w_is_stopping()) {
+          break;
+        }
+        // Timed out, or error.
+        continue;
+      }
+
+      if (w_is_stopping()) {
         break;
       }
-      // Timed out, or error.
-      // Arrange to sanity check that we're working
-      w_check_my_sock();
-      continue;
-    }
 
 #ifdef HAVE_ACCEPT4
-    client_fd = accept4(listener_fd, NULL, 0, SOCK_CLOEXEC);
+      client_fd = FileDescriptor(
+          accept4(
+              listener->getFileDescriptor().system_handle(),
+              nullptr,
+              0,
+              SOCK_CLOEXEC),
+          FileDescriptor::FDType::Socket);
 #else
-    client_fd = accept(listener_fd, NULL, 0);
+      client_fd = FileDescriptor(
+          ::accept(listener->getFileDescriptor().system_handle(), nullptr, 0),
+          FileDescriptor::FDType::Socket);
 #endif
-    if (client_fd == -1) {
-      continue;
-    }
-    w_set_cloexec(client_fd);
-    bufsize = WATCHMAN_IO_BUF_SIZE;
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF,
-        (void*)&bufsize, sizeof(bufsize));
+      if (!client_fd) {
+        continue;
+      }
+      client_fd.setCloExec();
+      bufsize = WATCHMAN_IO_BUF_SIZE;
+      ::setsockopt(
+          client_fd.system_handle(),
+          SOL_SOCKET,
+          SO_SNDBUF,
+          (char*)&bufsize,
+          sizeof(bufsize));
 
-    stm = w_stm_fdopen(client_fd);
-    if (!stm) {
-      w_log(W_LOG_ERR, "Failed to allocate stm for fd: %s\n",
-          strerror(errno));
-      close(client_fd);
-      continue;
+      make_new_client(w_stm_fdopen(std::move(client_fd)));
     }
-    make_new_client(stm);
   }
-}
-#endif
 
-bool w_start_listener(const char *path)
-{
+ public:
+  /** Start an accept loop thread using the provided socket
+   * descriptor (`fd`).  The `name` parameter is used to name the
+   * thread */
+  AcceptLoop(std::string name, FileDescriptor&& fd) {
+    fd.setCloExec();
+    fd.setNonBlock();
+
+    std::shared_ptr<watchman_event> listener_event(w_event_make_sockets());
+    listener_thread_events.push_back(listener_event);
+
+    thread_ = std::thread(
+        [listener_fd = std::move(fd), name, listener_event]() mutable {
+          w_set_thread_name(name);
+          accept_thread(std::move(listener_fd), listener_event);
+        });
+  }
+
+  AcceptLoop(const AcceptLoop&) = delete;
+  AcceptLoop& operator=(const AcceptLoop&) = delete;
+
+  AcceptLoop(AcceptLoop&& other) {
+    *this = std::move(other);
+  }
+
+  AcceptLoop& operator=(AcceptLoop&& other) {
+    thread_ = std::move(other.thread_);
+    joined_ = other.joined_;
+    // Ensure that we don't try to join the source,
+    // as std::thread::join will std::terminate in that case.
+    // If it weren't for this we could use the compiler
+    // default implementation of move.
+    other.joined_ = true;
+    return *this;
+  }
+
+  ~AcceptLoop() {
+    join();
+  }
+
+  void join() {
+    if (joined_) {
+      return;
+    }
+    thread_.join();
+    joined_ = true;
+  }
+};
+
+bool w_start_listener() {
 #ifndef _WIN32
   struct sigaction sa;
   sigset_t sigset;
-#endif
-  void *ignored;
-
-  listener_thread = pthread_self();
-
-#ifdef HAVE_LIBGIMLI_H
-  hb = gimli_heartbeat_attach();
 #endif
 
 #if defined(HAVE_KQUEUE) || defined(HAVE_FSEVENTS)
   {
     struct rlimit limit;
-# ifndef __OpenBSD__
-    int mib[2] = { CTL_KERN,
-#  ifdef KERN_MAXFILESPERPROC
-      KERN_MAXFILESPERPROC
-#  else
-      KERN_MAXFILES
-#  endif
+#ifndef __OpenBSD__
+    int mib[2] = {
+        CTL_KERN,
+#ifdef KERN_MAXFILESPERPROC
+        KERN_MAXFILESPERPROC
+#else
+        KERN_MAXFILES
+#endif
     };
-# endif
+#endif
     int maxperproc;
 
     getrlimit(RLIMIT_NOFILE, &limit);
 
-# ifndef __OpenBSD__
+#ifndef __OpenBSD__
     {
       size_t len;
 
       len = sizeof(maxperproc);
       sysctl(mib, 2, &maxperproc, &len, NULL, 0);
-      w_log(W_LOG_ERR, "file limit is %" PRIu64
-          " kern.maxfilesperproc=%i\n",
-          limit.rlim_cur, maxperproc);
+      logf(
+          ERR,
+          "file limit is {} kern.maxfilesperproc={}\n",
+          limit.rlim_cur,
+          maxperproc);
     }
-# else
+#else
     maxperproc = limit.rlim_max;
-    w_log(W_LOG_ERR, "openfiles-cur is %" PRIu64
-        " openfiles-max=%i\n",
-        limit.rlim_cur, maxperproc);
-# endif
+    logf(
+        ERR,
+        "openfiles-cur is {} openfiles-max={}\n",
+        limit.rlim_cur,
+        maxperproc);
+#endif
 
-    if (limit.rlim_cur != RLIM_INFINITY &&
-        maxperproc > 0 &&
+    if (limit.rlim_cur != RLIM_INFINITY && maxperproc > 0 &&
         limit.rlim_cur < (rlim_t)maxperproc) {
       limit.rlim_cur = maxperproc;
 
       if (setrlimit(RLIMIT_NOFILE, &limit)) {
-        w_log(W_LOG_ERR,
-          "failed to raise limit to %" PRIu64 " (%s).\n",
-          limit.rlim_cur,
-          strerror(errno));
+        logf(
+            ERR,
+            "failed to raise limit to {} ({}).\n",
+            limit.rlim_cur,
+            folly::errnoStr(errno));
       } else {
-        w_log(W_LOG_ERR,
-            "raised file limit to %" PRIu64 "\n",
-            limit.rlim_cur);
+        logf(ERR, "raised file limit to {}\n", limit.rlim_cur);
       }
     }
 
     getrlimit(RLIMIT_NOFILE, &limit);
 #ifndef HAVE_FSEVENTS
     if (limit.rlim_cur < 10240) {
-      w_log(W_LOG_ERR,
-          "Your file descriptor limit is very low (%" PRIu64 "), "
+      logf(
+          ERR,
+          "Your file descriptor limit is very low ({})"
           "please consult the watchman docs on raising the limits\n",
           limit.rlim_cur);
     }
@@ -685,96 +828,112 @@ bool w_start_listener(const char *path)
   sigemptyset(&sigset);
   sigaddset(&sigset, SIGCHLD);
   sigprocmask(SIG_BLOCK, &sigset, NULL);
-
-  listener_fd = get_listener_socket(path);
-  if (listener_fd == -1) {
-    return false;
-  }
-  w_set_cloexec(listener_fd);
 #endif
+  setup_signal_handlers();
 
-  if (!clients) {
-    clients = w_ht_new(2, NULL);
-  }
+  folly::Optional<AcceptLoop> tcp_loop;
+  folly::Optional<AcceptLoop> unix_loop;
 
-#ifdef HAVE_LIBGIMLI_H
-  if (hb) {
-    gimli_heartbeat_set(hb, GIMLI_HB_RUNNING);
+  // When we unwind, ensure that we stop the accept threads
+  SCOPE_EXIT {
+    if (!w_is_stopping()) {
+      w_request_shutdown();
+    }
+    unix_loop.clear();
+    tcp_loop.clear();
+  };
+
+  if (listener_fd) {
+    // Assume that it was prepped by w_listener_prep_inetd()
+    logf(ERR, "Using socket from inetd as listening socket\n");
   } else {
-    w_setup_signal_handlers();
+    listener_fd = get_listener_unix_domain_socket(get_unix_sock_name().c_str());
+    if (!listener_fd) {
+      logf(ERR, "Failed to initialize unix domain listener\n");
+      return false;
+    }
   }
-#else
-  w_setup_signal_handlers();
-#endif
-  w_set_nonblock(listener_fd);
 
-  // Now run the dispatch
-#ifndef _WIN32
-  accept_loop();
-#else
-  named_pipe_accept_loop(path);
+  if (listener_fd && !disable_unix_socket) {
+    unix_loop.assign(AcceptLoop("unix-listener", std::move(listener_fd)));
+  }
+
+  if (Configuration().getBool("tcp-listener-enable", false)) {
+    tcp_loop.assign(AcceptLoop("tcp-listener", get_listener_tcp_socket()));
+  }
+
+  startSanityCheckThread();
+
+#ifdef _WIN32
+  // Start the named pipes and join them; this will
+  // block until the server is shutdown.
+  if (!disable_named_pipe) {
+    named_pipe_accept_loop();
+  }
 #endif
 
-#ifndef _WIN32
-  /* close out some resources to persuade valgrind to run clean */
-  close(listener_fd);
-  listener_fd = -1;
-#endif
+  // Clearing these will cause .join() to be called,
+  // so the next two lines will block until the server
+  // shutdown is initiated, rather than cause the server
+  // to shutdown.
+  unix_loop.clear();
+  tcp_loop.clear();
 
   // Wait for clients, waking any sleeping clients up in the process
   {
-    int interval = 2000;
-    int last_count = 0, n_clients = 0;
-    const int max_interval = 1000000; // 1 second
+    auto interval = std::chrono::microseconds(2000);
+    const auto max_interval = std::chrono::seconds(1);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
 
-    do {
-      w_ht_iter_t iter;
+    size_t last_count = 0, n_clients = 0;
 
-      pthread_mutex_lock(&w_client_lock);
-      n_clients = w_ht_size(clients);
+    while (true) {
+      {
+        auto clientsLock = clients.rlock();
+        n_clients = clientsLock->size();
 
-      if (w_ht_first(clients, &iter)) do {
-        auto client = (watchman_client *)w_ht_val_ptr(iter.value);
-        w_event_set(client->ping);
-
-#ifndef _WIN32
-        // If we've been waiting around for a while, interrupt
-        // the client thread; it may be blocked on a write
-        if (interval >= max_interval) {
-          pthread_kill(client->thread_handle, SIGUSR1);
+        for (auto client : *clientsLock) {
+          client->ping->notify();
         }
-#endif
-      } while (w_ht_next(clients, &iter));
+      }
 
-      pthread_mutex_unlock(&w_client_lock);
+      if (n_clients == 0) {
+        break;
+      }
+
+      if (std::chrono::steady_clock::now() >= deadline) {
+        log(ERR, "Abandoning wait for ", n_clients, " outstanding clients\n");
+        break;
+      }
 
       if (n_clients != last_count) {
-        w_log(W_LOG_ERR, "waiting for %d clients to terminate\n", n_clients);
+        log(ERR, "waiting for ", n_clients, " clients to terminate\n");
       }
-      usleep(interval);
-      interval = MIN(interval * 2, max_interval);
-    } while (n_clients > 0);
+
+      /* sleep override */
+      std::this_thread::sleep_for(interval);
+      interval *= 2;
+      if (interval > max_interval) {
+        interval = max_interval;
+      }
+    }
   }
 
-  pthread_join(reaper_thread, &ignored);
   w_state_shutdown();
 
   return true;
 }
 
 /* get-pid */
-static void cmd_get_pid(struct watchman_client *client, json_t *args)
-{
-  json_t *resp = make_response();
+static void cmd_get_pid(struct watchman_client* client, const json_ref&) {
+  auto resp = make_response();
 
-  unused_parameter(args);
+  resp.set("pid", json_integer(::getpid()));
 
-  set_prop(resp, "pid", json_integer(getpid()));
-
-  send_and_dispose_response(client, resp);
+  send_and_dispose_response(client, std::move(resp));
 }
 W_CMD_REG("get-pid", cmd_get_pid, CMD_DAEMON, NULL)
-
 
 /* vim:ts=2:sw=2:et:
  */

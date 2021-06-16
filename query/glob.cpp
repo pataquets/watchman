@@ -2,7 +2,12 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include <folly/ScopeGuard.h>
+#include <memory>
+#include "InMemoryView.h"
 #include "thirdparty/wildmatch/wildmatch.h"
+
+using std::make_unique;
 
 /* The glob generator.
  * The user can specify a list of globs as the set of candidate nodes
@@ -23,34 +28,13 @@
 
 W_CAP_REG("glob_generator")
 
-// Holds a list of glob matching rules
-struct glob_child_vec {
-  struct watchman_glob_tree **children;
-  uint32_t num_children;
-  uint32_t num_children_allocd;
-};
-
-// A node in the tree of node matching rules
-struct watchman_glob_tree {
-  char *pattern;
-  uint32_t pattern_len;
-
-  // The list of child rules, excluding any ** rules
-  struct glob_child_vec children;
-  // The list of ** rules that exist under this node
-  struct glob_child_vec doublestar_children;
-
-  unsigned is_leaf:1;       // if true, generate files for matches
-  unsigned had_specials:1;  // if false, can do simple string compare
-  unsigned is_doublestar:1; // pattern begins with **
-};
-
 // Look ahead in pattern; we want to find the directory separator.
 // While we are looking, check for wildmatch special characters.
 // If we do not find a directory separator, return NULL.
-static inline const char *find_sep_and_specials(const char *pattern,
-                                                const char *end,
-                                                bool *had_specials) {
+static inline const char* find_sep_and_specials(
+    const char* pattern,
+    const char* end,
+    bool* had_specials) {
   *had_specials = false;
   while (pattern < end) {
     switch (*pattern) {
@@ -69,100 +53,91 @@ static inline const char *find_sep_and_specials(const char *pattern,
   return NULL;
 }
 
-static void destroy_glob_child_vec(struct glob_child_vec *vec) {
-  uint32_t i;
-  for (i = 0; i < vec->num_children; ++i) {
-    free_glob_tree(vec->children[i]);
-  }
-  free(vec->children);
-}
-
-void free_glob_tree(struct watchman_glob_tree *node) {
-
-  if (!node) {
-    return;
-  }
-  destroy_glob_child_vec(&node->children);
-  destroy_glob_child_vec(&node->doublestar_children);
-
-  free(node);
-}
-
-static struct watchman_glob_tree *make_node(const char *pattern,
-                                            uint32_t pattern_len) {
-  struct watchman_glob_tree *node;
-
-  node = (watchman_glob_tree*)calloc(1, sizeof(*node) + pattern_len + 1);
-  if (!node) {
-    return NULL;
-  }
-
-  node->pattern = (char*)(node + 1);
-  memcpy(node->pattern, pattern, pattern_len);
-  node->pattern[pattern_len] = '\0';
-
-  node->pattern_len = pattern_len;
-
-  return node;
-}
+watchman_glob_tree::watchman_glob_tree(
+    const char* pattern,
+    uint32_t pattern_len)
+    : pattern(pattern, pattern_len),
+      is_leaf(0),
+      had_specials(0),
+      is_doublestar(0) {}
 
 // Simple brute force lookup of pattern within a node.
 // This is run at compile time and most glob sets are low enough cardinality
 // that this doesn't turn out to be a hot spot in practice.
-static struct watchman_glob_tree *lookup_node_child(struct glob_child_vec *vec,
-                                                    const char *pattern,
-                                                    uint32_t pattern_len) {
-  uint32_t i;
-
-  for (i = 0; i < vec->num_children; ++i) {
-    if (vec->children[i]->pattern_len == pattern_len &&
-        memcmp(vec->children[i]->pattern, pattern, pattern_len) == 0) {
-      return vec->children[i];
+static watchman_glob_tree* lookup_node_child(
+    std::vector<std::unique_ptr<watchman_glob_tree>>* vec,
+    const char* pattern,
+    uint32_t pattern_len) {
+  for (auto& kid : *vec) {
+    if (kid->pattern.size() == pattern_len &&
+        memcmp(kid->pattern.data(), pattern, pattern_len) == 0) {
+      return kid.get();
     }
   }
-  return NULL;
+  return nullptr;
 }
 
-// Add a child node to parent, allocating more space if needed.
-static bool add_node(struct glob_child_vec *vec,
-                     struct watchman_glob_tree *child) {
-  if (!vec->children) {
-    vec->num_children_allocd = 8;
-    vec->children = (watchman_glob_tree**)calloc(
-        vec->num_children_allocd, sizeof(*vec->children));
-    if (!vec->children) {
-      return false;
-    }
-  } else if (vec->num_children + 1 > vec->num_children_allocd) {
-    auto bigger = (watchman_glob_tree**)realloc(
-        vec->children, vec->num_children_allocd * 2 * sizeof(*vec->children));
-    if (!bigger) {
-      return false;
-    }
-    vec->num_children_allocd *= 2;
-    vec->children = bigger;
+std::vector<std::string> watchman_glob_tree::unparse() const {
+  std::vector<std::string> result;
+  unparse_into(result, "");
+  return result;
+}
+
+// Performs the heavy lifting for reversing the parse process
+// to compute a list of glob strings.
+// `globStrings` is the target array for the glob expressions.
+// `relative` is the glob-expression-so-far that the current
+// node will append to when it produces its glob string output.
+// This function recurses down the glob tree calling unparse_into
+// on its children.
+void watchman_glob_tree::unparse_into(
+    std::vector<std::string>& globStrings,
+    folly::StringPiece relative) const {
+  auto needSlash = !relative.empty() && !relative.endsWith('/');
+  auto optSlash = needSlash ? "/" : "";
+
+  // If there are no children of this node, it is effectively a leaf
+  // node. Leaves correspond to a concrete glob string that we need
+  // to emit, so here's where we do that.
+  if (is_leaf || children.size() + doublestar_children.size() == 0) {
+    globStrings.push_back(folly::to<std::string>(relative, optSlash, pattern));
   }
 
-  vec->children[vec->num_children++] = child;
-  return true;
+  for (auto& child : children) {
+    child->unparse_into(
+        globStrings, folly::to<std::string>(relative, optSlash, pattern));
+  }
+  for (auto& child : doublestar_children) {
+    child->unparse_into(
+        globStrings, folly::to<std::string>(relative, optSlash, pattern));
+  }
 }
 
 // Compile and add a new glob pattern to the tree.
 // Compilation splits a pattern into nodes, with one node for each directory
 // separator separated path component.
-static bool add_glob(struct watchman_glob_tree *tree, w_string_t *glob_str) {
-  struct watchman_glob_tree *parent = tree;
-  const char *pattern = glob_str->buf;
-  const char *pattern_end = pattern + glob_str->len;
+static bool add_glob(
+    struct watchman_glob_tree* tree,
+    const w_string& glob_str) {
+  struct watchman_glob_tree* parent = tree;
+  const char* pattern = glob_str.data();
+  const char* pattern_end = pattern + glob_str.size();
   bool had_specials;
 
+  if (glob_str.piece().pathIsAbsolute()) {
+    throw QueryParseError(folly::to<std::string>(
+        "glob `",
+        glob_str,
+        "` is an absolute path.  All globs must be relative paths!"));
+  }
+
   while (pattern < pattern_end) {
-    const char *sep =
+    const char* sep =
         find_sep_and_specials(pattern, pattern_end, &had_specials);
-    const char *end;
-    struct watchman_glob_tree *node;
+    const char* end;
+    struct watchman_glob_tree* node;
     bool is_doublestar = false;
-    struct glob_child_vec *container = &parent->children;
+    auto* container = &parent->children;
 
     end = sep ? sep : pattern_end;
 
@@ -184,13 +159,9 @@ static bool add_glob(struct watchman_glob_tree *tree, w_string_t *glob_str) {
     node = lookup_node_child(container, pattern, (uint32_t)(end - pattern));
     if (!node) {
       // This is a new matching possibility.
-      node = make_node(pattern, (uint32_t)(end - pattern));
-      if (!node) {
-        return false;
-      }
-      if (!add_node(container, node)) {
-        return false;
-      }
+      container->emplace_back(
+          make_unique<watchman_glob_tree>(pattern, (uint32_t)(end - pattern)));
+      node = container->back().get();
       node->had_specials = had_specials;
       node->is_doublestar = is_doublestar;
     }
@@ -204,90 +175,123 @@ static bool add_glob(struct watchman_glob_tree *tree, w_string_t *glob_str) {
     }
 
     pattern = end + 1; // skip separator
-    parent = node;     // the next iteration uses this node as its parent
+    parent = node; // the next iteration uses this node as its parent
   }
 
   return true;
 }
 
-bool parse_globs(w_query *res, json_t *query)
-{
-  json_t *globs;
+void parse_globs(w_query* res, const json_ref& query) {
   size_t i;
-  int noescape = 0;
-  int includedotfiles = 0;
 
-  globs = json_object_get(query, "glob");
+  auto globs = query.get_default("glob");
   if (!globs) {
-    return true;
+    return;
   }
 
-  if (!json_is_array(globs)) {
-    res->errmsg = strdup("'glob' must be an array");
-    return false;
+  if (!globs.isArray()) {
+    throw QueryParseError("'glob' must be an array");
   }
 
   // Globs implicitly enable dedup_results mode
   res->dedup_results = true;
 
-  if (json_unpack(query, "{s?b}", "glob_noescape", &noescape) != 0) {
-    res->errmsg = strdup("glob_noescape must be a boolean");
-    return false;
+  auto noescape = query.get_default("glob_noescape", json_false());
+  if (!noescape.isBool()) {
+    throw QueryParseError("glob_noescape must be a boolean");
   }
 
-  if (json_unpack(query, "{s?b}", "glob_includedotfiles", &includedotfiles) !=
-      0) {
-    res->errmsg = strdup("glob_includedotfiles must be a boolean");
-    return false;
+  auto includedotfiles =
+      query.get_default("glob_includedotfiles", json_false());
+  if (!includedotfiles.isBool()) {
+    throw QueryParseError("glob_includedotfiles must be a boolean");
   }
 
-  res->glob_flags =
-      (includedotfiles ? 0 : WM_PERIOD) | (noescape ? WM_NOESCAPE : 0);
+  res->glob_flags = (includedotfiles.asBool() ? 0 : WM_PERIOD) |
+      (noescape.asBool() ? WM_NOESCAPE : 0);
 
-  res->glob_tree = make_node("", 0);
+  res->glob_tree = make_unique<watchman_glob_tree>("", 0);
   for (i = 0; i < json_array_size(globs); i++) {
-    json_t *ele = json_array_get(globs, i);
-    w_string_t *pattern = json_to_w_string(ele);
+    const auto& ele = globs.at(i);
+    const auto& pattern = json_to_w_string(ele);
 
-    if (!add_glob(res->glob_tree, pattern)) {
-      res->errmsg = strdup("failed to compile multi-glob");
-      return false;
+    if (!add_glob(res->glob_tree.get(), pattern)) {
+      throw QueryParseError("failed to compile multi-glob");
     }
   }
+}
 
-  return true;
+static w_string parse_suffix(const json_ref& ele) {
+  if (!ele.isString()) {
+    throw QueryParseError("'suffix' must be a string or an array of strings");
+  }
+
+  auto str = json_to_w_string(ele);
+
+  return str.piece().asLowerCase(str.type());
+}
+
+void parse_suffixes(w_query* res, const json_ref& query) {
+  auto suffixes = query.get_default("suffix");
+  if (!suffixes) {
+    return;
+  }
+
+  std::vector<json_ref> suffixArray;
+  if (suffixes.isString()) {
+    suffixArray.push_back(suffixes);
+  } else if (suffixes.isArray()) {
+    suffixArray = suffixes.array();
+  } else {
+    throw QueryParseError("'suffix' must be a string or an array of strings");
+  }
+
+  if (query.get_default("glob")) {
+    throw QueryParseError(
+        "'suffix' cannot be used together with the 'glob' generator");
+  }
+
+  // Globs implicitly enable dedup_results mode
+  res->dedup_results = true;
+  // Suffix queries are defined as being case insensitive
+  res->glob_flags = WM_CASEFOLD;
+  res->glob_tree = folly::make_unique<watchman_glob_tree>("", 0);
+
+  for (auto& ele : suffixArray) {
+    if (!ele.isString()) {
+      throw QueryParseError("'suffix' must be a string or an array of strings");
+    }
+
+    auto suff = parse_suffix(ele);
+    auto pattern = w_string::build("**/*.", suff);
+    if (!add_glob(res->glob_tree.get(), pattern)) {
+      throw QueryParseError("failed to compile multi-glob");
+    }
+  }
 }
 
 /** Concatenate dir_name and name around a unix style directory
  * separator.
  * dir_name may be NULL in which case this returns a copy of name.
  */
-static inline char *make_path_name(const char *dir_name, uint32_t dlen,
-                                   const char *name, uint32_t nlen) {
-  char *result;
+static inline std::string make_path_name(
+    const char* dir_name,
+    uint32_t dlen,
+    const char* name,
+    uint32_t nlen) {
+  std::string result;
+  result.reserve(dlen + nlen + 1);
 
   if (dlen) {
-    result = (char*)malloc(dlen + nlen + 2);
-    if (!result) {
-      return NULL;
-    }
-    memcpy(result, dir_name, dlen);
-    result[dlen] = '/'; // wildmatch wants unix separators
-    memcpy(result + dlen + 1, name, nlen);
-    result[dlen + nlen + 1] = '\0';
-
-    return result;
+    result.append(dir_name, dlen);
+    // wildmatch wants unix separators
+    result.push_back('/');
   }
-
-  result = (char*)malloc(nlen + 1);
-  if (!result) {
-    return NULL;
-  }
-  memcpy(result, name, nlen);
-  result[nlen] = '\0';
+  result.append(name, nlen);
   return result;
 }
 
+namespace watchman {
 /** This is our specialized handler for the ** recursive glob pattern.
  * This is the unhappy path because we have no choice but to recursively
  * walk the tree; we have no way to prune portions that won't match.
@@ -300,120 +304,80 @@ static inline char *make_path_name(const char *dir_name, uint32_t dlen,
  * file against the list of patterns, terminating that match as soon
  * as any one of them matches the file node.
  */
-static bool glob_generator_doublestar(struct w_query_ctx *ctx,
-                                      int64_t *num_walked,
-                                      struct read_locked_watchman_root *lock,
-                                      const struct watchman_dir *dir,
-                                      const struct watchman_glob_tree *node,
-                                      const char *dir_name,
-                                      uint32_t dir_name_len) {
-  int64_t n = 0;
-  bool result = true;
+void InMemoryView::globGeneratorDoublestar(
+    struct w_query_ctx* ctx,
+    const struct watchman_dir* dir,
+    const struct watchman_glob_tree* node,
+    const char* dir_name,
+    uint32_t dir_name_len) const {
   bool matched;
-  char *subject;
-  uint32_t j;
 
   // First step is to walk the set of files contained in this node
   for (auto& it : dir->files) {
     auto file = it.second.get();
-    w_string_t *file_name = w_file_get_name(file);
+    auto file_name = file->getName();
 
-    ++n;
+    ctx->bumpNumWalked();
 
     if (!file->exists) {
       // Globs can only match files that exist
       continue;
     }
 
-    subject =
-        make_path_name(dir_name, dir_name_len, file_name->buf, file_name->len);
-    if (!subject) {
-      result = false;
-      goto done;
-    }
+    auto subject = make_path_name(
+        dir_name, dir_name_len, file_name.data(), file_name.size());
 
     // Now that we have computed the name of this candidate file node,
     // attempt to match against each of the possible doublestar patterns
     // in turn.  As soon as any one of them matches we can stop this loop
     // as it doesn't make a lot of sense to yield multiple results for
     // the same file.
-    for (j = 0; j < node->doublestar_children.num_children; ++j) {
-      struct watchman_glob_tree *child_node =
-          node->doublestar_children.children[j];
-
-      matched = wildmatch(child_node->pattern, subject,
-                          ctx->query->glob_flags | WM_PATHNAME |
-                              (ctx->query->case_sensitive ? 0 : WM_CASEFOLD),
-                          0) == WM_MATCH;
+    for (const auto& child_node : node->doublestar_children) {
+      matched =
+          wildmatch(
+              child_node->pattern.c_str(),
+              subject.c_str(),
+              ctx->query->glob_flags | WM_PATHNAME |
+                  (ctx->query->case_sensitive == CaseSensitivity::CaseSensitive
+                       ? 0
+                       : WM_CASEFOLD),
+              0) == WM_MATCH;
 
       if (matched) {
-        if (!w_query_process_file(ctx->query, ctx, file)) {
-          result = false;
-          free(subject);
-          goto done;
-        }
+        w_query_process_file(
+            ctx->query, ctx, make_unique<InMemoryFileResult>(file, caches_));
         // No sense running multiple matches for this same file node
         // if this one succeeded.
         break;
       }
     }
-
-    free(subject);
   }
 
   // And now walk down to any dirs; all dirs are eligible
   for (auto& it : dir->dirs) {
     const auto child = it.second.get();
-    int64_t child_walked = 0;
 
     if (!child->last_check_existed) {
       // Globs can only match files in dirs that exist
       continue;
     }
 
-    subject = make_path_name(
+    auto subject = make_path_name(
         dir_name, dir_name_len, child->name.data(), child->name.size());
-    if (!subject) {
-      result = false;
-      goto done;
-    }
-    result = glob_generator_doublestar(
-        ctx, &child_walked, lock, child, node, subject, strlen_uint32(subject));
-    free(subject);
-    n += child_walked;
-    if (!result) {
-      goto done;
-    }
+    globGeneratorDoublestar(ctx, child, node, subject.data(), subject.size());
   }
-
-done:
-  *num_walked = n;
-  return result;
 }
 
 /* Match each child of node against the children of dir */
-static bool glob_generator_tree(struct w_query_ctx *ctx, int64_t *num_walked,
-                                struct read_locked_watchman_root *lock,
-                                const struct watchman_glob_tree *node,
-                                const struct watchman_dir *dir) {
-  uint32_t i;
-  w_string_t component;
-  bool result = true;
-  int64_t n = 0;
-
-  if (node->doublestar_children.num_children > 0) {
-    int64_t child_walked = 0;
-    result =
-        glob_generator_doublestar(ctx, &child_walked, lock, dir, node, NULL, 0);
-    n += child_walked;
-    if (!result) {
-      goto done;
-    }
+void InMemoryView::globGeneratorTree(
+    struct w_query_ctx* ctx,
+    const struct watchman_glob_tree* node,
+    const struct watchman_dir* dir) const {
+  if (!node->doublestar_children.empty()) {
+    globGeneratorDoublestar(ctx, dir, node, nullptr, 0);
   }
 
-  for (i = 0; i < node->children.num_children; ++i) {
-    const struct watchman_glob_tree *child_node = node->children.children[i];
-
+  for (const auto& child_node : node->children) {
     w_assert(!child_node->is_doublestar, "should not get here with ** glob");
 
     // If there are child dirs, consider them for recursion.
@@ -422,22 +386,14 @@ static bool glob_generator_tree(struct w_query_ctx *ctx, int64_t *num_walked,
     // and we don't want to preclude matching the latter.
     if (!dir->dirs.empty()) {
       // Attempt direct lookup if possible
-      if (!child_node->had_specials && ctx->query->case_sensitive) {
-        w_string_new_len_typed_stack(
-            &component,
-            child_node->pattern,
-            child_node->pattern_len,
-            W_STRING_BYTE);
-        const auto child_dir = dir->getChildDir(&component);
+      if (!child_node->had_specials &&
+          ctx->query->case_sensitive == CaseSensitivity::CaseSensitive) {
+        w_string_piece component(
+            child_node->pattern.data(), child_node->pattern.size());
+        const auto child_dir = dir->getChildDir(component);
 
         if (child_dir) {
-          int64_t child_walked = 0;
-          result = glob_generator_tree(
-              ctx, &child_walked, lock, child_node, child_dir);
-          n += child_walked;
-          if (!result) {
-            goto done;
-          }
+          globGeneratorTree(ctx, child_node.get(), child_dir);
         }
       } else {
         // Otherwise we have to walk and match
@@ -450,18 +406,15 @@ static bool glob_generator_tree(struct w_query_ctx *ctx, int64_t *num_walked,
           }
 
           if (wildmatch(
-                  child_node->pattern,
+                  child_node->pattern.c_str(),
                   child_dir->name.c_str(),
                   ctx->query->glob_flags |
-                      (ctx->query->case_sensitive ? 0 : WM_CASEFOLD),
+                      (ctx->query->case_sensitive ==
+                               CaseSensitivity::CaseSensitive
+                           ? 0
+                           : WM_CASEFOLD),
                   0) == WM_MATCH) {
-            int64_t child_walked = 0;
-            result = glob_generator_tree(
-                ctx, &child_walked, lock, child_node, child_dir);
-            n += child_walked;
-            if (!result) {
-              goto done;
-            }
+            globGeneratorTree(ctx, child_node.get(), child_dir);
           }
         }
       }
@@ -470,27 +423,28 @@ static bool glob_generator_tree(struct w_query_ctx *ctx, int64_t *num_walked,
     // If the node is a leaf we are in a position to match files.
     if (child_node->is_leaf && !dir->files.empty()) {
       // Attempt direct lookup if possible
-      if (!child_node->had_specials && ctx->query->case_sensitive) {
-        w_string_new_len_typed_stack(&component, child_node->pattern,
-                                     child_node->pattern_len, W_STRING_BYTE);
-        auto file = dir->getChildFile(&component);
+      if (!child_node->had_specials &&
+          ctx->query->case_sensitive == CaseSensitivity::CaseSensitive) {
+        w_string_piece component(
+            child_node->pattern.data(), child_node->pattern.size());
+        auto file = dir->getChildFile(component);
 
         if (file) {
-          ++n;
+          ctx->bumpNumWalked();
           if (file->exists) {
             // Globs can only match files that exist
-            result = w_query_process_file(ctx->query, ctx, file);
-            if (!result) {
-              goto done;
-            }
+            w_query_process_file(
+                ctx->query,
+                ctx,
+                make_unique<InMemoryFileResult>(file, caches_));
           }
         }
       } else {
         for (auto& it : dir->files) {
           // Otherwise we have to walk and match
           auto file = it.second.get();
-          w_string_t* file_name = w_file_get_name(file);
-          ++n;
+          auto file_name = file->getName();
+          ctx->bumpNumWalked();
 
           if (!file->exists) {
             // Globs can only match files that exist
@@ -498,49 +452,49 @@ static bool glob_generator_tree(struct w_query_ctx *ctx, int64_t *num_walked,
           }
 
           if (wildmatch(
-                  child_node->pattern,
-                  file_name->buf,
+                  child_node->pattern.c_str(),
+                  file_name.data(),
                   ctx->query->glob_flags |
-                      (ctx->query->case_sensitive ? WM_CASEFOLD : 0),
+                      (ctx->query->case_sensitive ==
+                               CaseSensitivity::CaseSensitive
+                           ? 0
+                           : WM_CASEFOLD),
                   0) == WM_MATCH) {
-            if (!w_query_process_file(ctx->query, ctx, file)) {
-              result = false;
-              goto done;
-            }
+            w_query_process_file(
+                ctx->query,
+                ctx,
+                make_unique<InMemoryFileResult>(file, caches_));
           }
         }
       }
     }
   }
-
-done:
-  *num_walked = n;
-  return result;
 }
 
-bool glob_generator(w_query *query, struct read_locked_watchman_root *lock,
-                    struct w_query_ctx *ctx, int64_t *num_walked) {
-  w_string_t *relative_root;
+void InMemoryView::globGenerator(w_query* query, struct w_query_ctx* ctx)
+    const {
+  w_string relative_root;
 
-  if (query->relative_root != NULL) {
+  if (query->relative_root) {
     relative_root = query->relative_root;
   } else {
-    relative_root = lock->root->root_path;
+    relative_root = rootPath_;
   }
 
-  const auto dir = w_root_resolve_dir_read(lock, relative_root);
+  auto view = view_.rlock();
+
+  const auto dir = view->resolveDir(relative_root);
   if (!dir) {
-    ignore_result(asprintf(
-        &query->errmsg,
-        "glob_generator could not resolve %.*s, check your "
-        "relative_root parameter!\n",
-        relative_root->len,
-        relative_root->buf));
-    return false;
+    throw QueryExecError(folly::to<std::string>(
+        "glob_generator could not resolve ",
+        relative_root,
+        ", check your "
+        "relative_root parameter!"));
   }
 
-  return glob_generator_tree(ctx, num_walked, lock, query->glob_tree, dir);
+  globGeneratorTree(ctx, query->glob_tree.get(), dir);
 }
+} // namespace watchman
 
 /* vim:ts=2:sw=2:et:
  */

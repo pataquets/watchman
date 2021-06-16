@@ -1,9 +1,10 @@
 ---
-id: cli-options
+pageid: cli-options
 title: Command Line
 layout: docs
 section: Invocation
 permalink: docs/cli-options.html
+redirect_from: docs/cli-options/
 ---
 
 The `watchman` executable contains both the client and the server components

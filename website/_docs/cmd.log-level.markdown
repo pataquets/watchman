@@ -1,9 +1,10 @@
 ---
-id: cmd.log-level
+pageid: cmd.log-level
 title: log-level
 layout: docs
 section: Commands
 permalink: docs/cmd/log-level.html
+redirect_from: docs/cmd/log-level/
 ---
 
 Changes the log level of your connection to the watchman service.

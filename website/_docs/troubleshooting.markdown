@@ -1,9 +1,10 @@
 ---
-id: troubleshooting
+pageid: troubleshooting
 title: Troubleshooting
 layout: docs
 section: Troubleshooting
 permalink: docs/troubleshooting.html
+redirect_from: docs/troubleshooting/
 ---
 
 We try to give directed advice in Watchman error diagnostics, which means that
@@ -57,7 +58,7 @@ accordingly.
 
 ### kFSEventStreamEventFlagUserDropped
 
-OS X has a similar internal limit and behavior when that limit is exceeded.
+macOS has a similar internal limit and behavior when that limit is exceeded.
 If you're encountering a message like:
 
 ```
@@ -86,14 +87,11 @@ be the location that holds your logs.  If not, the default for `STATEDIR`
 will be `<PREFIX>/var/run/watchman`, or for older versions of watchman,
 the logs may be placed in `<TMPDIR>/.watchman.<USER>.log`.
 
-If you're running a `homebrew` build of watchman, you'll find the logs in a
-path named something like
-`/usr/local/Cellar/watchman/3.2.0/var/run/watchman/<USER>.log`.
-
 *Since 3.8.*
 
 Watchman places the logs in a file named `<STATEDIR>/log`, which will
-typically be a location like `<PREFIX>/var/run/watchman/<USER>-state/log`.
+typically be a location like `<PREFIX>/var/run/watchman/<USER>-state/log`. If
+you're running a `homebrew` build of watchman, `<PREFIX>` is usually `/usr/local`.
 
 The default log location may be overridden by the `--logfile` [Server Option](
 /watchman/docs/cli-options.html#server-options).
@@ -188,7 +186,7 @@ limits.
 
 ## FSEvents
 
-FSEvents is the file watching facility on OS X.  There are few diagnostics
+FSEvents is the file watching facility on macOS.  There are few diagnostics
 that can help diagnose issues with FSEvents; the API itself gives little
 feedback on a number of error cases and instead emits rather cryptic error
 messages to the log file.
@@ -232,7 +230,7 @@ progressively more invasive:
 * Restart the fsevents service: `sudo pkill -9 -x fseventsd`
 * Restart your computer
 
-## Triggers/Subscriptions don't fire on OS X
+## Triggers/Subscriptions don't fire on macOS
 
 There is a rare fsevents bug that can prevent any notifications from working
 in directories where the case of the name of a directory in the kernel has

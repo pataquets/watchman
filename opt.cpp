@@ -4,16 +4,17 @@
 #include "watchman.h"
 #include <getopt.h>
 
-#define IS_REQUIRED(x)  (x) == REQ_STRING
+using namespace watchman;
+
+#define IS_REQUIRED(x) (x) == REQ_STRING
 
 /* One does not simply use getopt_long() */
 
-void usage(struct watchman_getopt *opts, FILE *where)
-{
+[[noreturn]] void usage(struct watchman_getopt* opts, FILE* where) {
   int i;
   size_t len;
   size_t longest = 0;
-  const char *label;
+  const char* label;
 
   fprintf(where, "Usage: watchman [opts] command\n");
 
@@ -26,8 +27,7 @@ void usage(struct watchman_getopt *opts, FILE *where)
       case REQ_STRING:
         len += strlen(label) + strlen("=");
         break;
-      default:
-        ;
+      default:;
     }
 
     if (opts[i].shortopt) {
@@ -75,24 +75,26 @@ void usage(struct watchman_getopt *opts, FILE *where)
 
   print_command_list_for_help(where);
 
-  fprintf(where,
-"\n"
-"See https://github.com/facebook/watchman#watchman for more help\n"
-"\n"
-"Watchman, by Wez Furlong.\n"
-"Copyright 2012-2015 Facebook, Inc.\n"
-  );
+  fprintf(
+      where,
+      "\n"
+      "See https://github.com/facebook/watchman#watchman for more help\n"
+      "\n"
+      "Watchman, by Wez Furlong.\n"
+      "Copyright 2012-2020 Facebook, Inc.\n");
 
   exit(1);
 }
 
-bool w_getopt(struct watchman_getopt *opts, int *argcp, char ***argvp,
-    char ***daemon_argvp)
-{
+bool w_getopt(
+    struct watchman_getopt* opts,
+    int* argcp,
+    char*** argvp,
+    char*** daemon_argvp) {
   int num_opts, i;
-  char *nextshort;
+  char* nextshort;
   int argc = *argcp;
-  char **argv = *argvp;
+  char** argv = *argvp;
   int long_pos = -1;
   int res;
   int num_daemon = 0;
@@ -105,23 +107,20 @@ bool w_getopt(struct watchman_getopt *opts, int *argcp, char ***argvp,
   /* to hold the args we pass to the daemon */
   auto daemon_argv = (char**)calloc(num_opts + 1, sizeof(char*));
   if (!daemon_argv) {
-    perror("calloc daemon opts");
-    abort();
+    log(FATAL, "calloc daemon opts\n");
   }
   *daemon_argvp = daemon_argv;
 
   /* something to hold the long options */
   auto long_opts = (option*)calloc(num_opts + 1, sizeof(struct option));
   if (!long_opts) {
-    perror("calloc struct option");
-    abort();
+    log(FATAL, "calloc struct option\n");
   }
 
   /* and the short options */
   auto shortopts = (char*)malloc((1 + num_opts) * 2);
   if (!shortopts) {
-    perror("malloc shortopts");
-    abort();
+    log(FATAL, "malloc shortopts\n");
   }
   nextshort = shortopts;
   nextshort[0] = ':';
@@ -154,9 +153,9 @@ bool w_getopt(struct watchman_getopt *opts, int *argcp, char ***argvp,
 
   nextshort[0] = 0;
 
-  while ((res = getopt_long(argc, argv, shortopts,
-        long_opts, &long_pos)) != -1) {
-    struct watchman_getopt *o;
+  while ((res = getopt_long(argc, argv, shortopts, long_opts, &long_pos)) !=
+         -1) {
+    struct watchman_getopt* o;
 
     switch (res) {
       case ':':
@@ -165,7 +164,9 @@ bool w_getopt(struct watchman_getopt *opts, int *argcp, char ***argvp,
         for (long_pos = 0; long_pos < num_opts; long_pos++) {
           if (opts[long_pos].shortopt == optopt) {
             if (IS_REQUIRED(opts[long_pos].argtype)) {
-              fprintf(stderr, "--%s (-%c) requires an argument",
+              fprintf(
+                  stderr,
+                  "--%s (-%c) requires an argument",
                   opts[long_pos].optname,
                   opts[long_pos].shortopt);
               return false;
@@ -176,7 +177,7 @@ bool w_getopt(struct watchman_getopt *opts, int *argcp, char ***argvp,
 
       case '?':
         /* unknown option */
-        fprintf(stderr, "Unknown or invalid option! %s\n", argv[optind-1]);
+        fprintf(stderr, "Unknown or invalid option! %s\n", argv[optind - 1]);
         usage(opts, stderr);
         return false;
 
@@ -196,39 +197,34 @@ bool w_getopt(struct watchman_getopt *opts, int *argcp, char ***argvp,
         }
 
         if (o->is_daemon) {
-          char *val;
-          ignore_result(asprintf(&val, "--%s=%s", o->optname, optarg));
-          daemon_argv[num_daemon++] = val;
+          auto value = folly::to<std::string>(
+              "--", o->optname, "=", optarg ? optarg : "");
+          // we deliberately leak this value to the caller
+          daemon_argv[num_daemon++] = strdup(value.c_str());
         }
 
         /* store the argument if we found one */
         if (o->argtype != OPT_NONE && o->val && optarg) {
           switch (o->argtype) {
-            case REQ_INT:
-            {
-              json_t *ival = json_integer(atoi(optarg));
-              *(int*)o->val = (int)json_integer_value(ival);
-              cfg_set_arg(o->optname, ival);
-              json_decref(ival);
+            case REQ_INT: {
+              auto ival = atoi(optarg);
+              *(int*)o->val = ival;
+              cfg_set_arg(o->optname, json_integer(ival));
               break;
             }
-            case REQ_STRING:
-            {
-              json_t *sval = typed_string_to_json(optarg, W_STRING_UNICODE);
-              *(char**)o->val = strdup(optarg);
+            case REQ_STRING: {
+              auto sval = typed_string_to_json(optarg, W_STRING_UNICODE);
+              *(std::string*)o->val = optarg;
               cfg_set_arg(o->optname, sval);
-              json_decref(sval);
               break;
             }
-            case OPT_NONE:
-              ;
+            case OPT_NONE:;
           }
         }
         if (o->argtype == OPT_NONE && o->val) {
-          json_t *bval = json_true();
+          auto bval = json_true();
           *(int*)o->val = 1;
           cfg_set_arg(o->optname, bval);
-          json_decref(bval);
         }
     }
 

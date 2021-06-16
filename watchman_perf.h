@@ -1,22 +1,23 @@
 /* Copyright 2016-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 
-#ifndef WATCHMAN_PERF_H
-#define WATCHMAN_PERF_H
+#pragma once
+
+#include "thirdparty/jansson/jansson.h"
+
+struct watchman_root;
 
 // Performance metrics sampling
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace watchman {
 
 struct watchman_perf_sample {
   // What we're sampling across
-  const char *description;
+  const char* description;
 
-  // Additional arbitrary information.  This is either NULL
-  // or is a json object with various properties set inside it
-  json_t* meta_data{nullptr};
+  // Additional arbitrary information.
+  // This is a json object with various properties set inside it
+  json_ref meta_data{json_object()};
 
   // Measure the wall time
   struct timeval time_begin, time_end, duration;
@@ -40,7 +41,6 @@ struct watchman_perf_sample {
 
   // Initialize and mark the start of a sample
   watchman_perf_sample(const char* description);
-  ~watchman_perf_sample();
   watchman_perf_sample(const watchman_perf_sample&) = delete;
   watchman_perf_sample(watchman_perf_sample&&) = delete;
 
@@ -53,10 +53,10 @@ struct watchman_perf_sample {
   bool finish();
 
   // Annotate the sample with metadata
-  void add_meta(const char* key, json_t* val);
+  void add_meta(const char* key, json_ref&& val);
 
   // Annotate the sample with some standard metadata taken from a root.
-  void add_root_meta(const w_root_t* root);
+  void add_root_meta(const std::shared_ptr<watchman_root>& root);
 
   // Force the sample to go to the log
   void force_log();
@@ -66,13 +66,16 @@ struct watchman_perf_sample {
 };
 typedef struct watchman_perf_sample w_perf_t;
 
+void perf_shutdown();
 
+void processSamples(
+    size_t argv_limit,
+    size_t maximum_batch_size,
+    json_ref samples,
+    std::function<void(std::vector<std::string>)> command_line,
+    std::function<void(std::string)> single_large_sample);
 
-#ifdef __cplusplus
-}
-#endif
-
-#endif
+} // namespace watchman
 
 /* vim:ts=2:sw=2:et:
  */

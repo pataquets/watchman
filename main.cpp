@@ -1,135 +1,135 @@
 /* Copyright 2012-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 #include "watchman.h"
+
+#include <folly/Exception.h>
+#include <folly/ScopeGuard.h>
+#include <folly/Singleton.h>
+#include <folly/SocketAddress.h>
+#include <folly/String.h>
+#include <folly/net/NetworkSocket.h>
+
+#include <stdio.h>
+#include <variant>
+
+#include "ChildProcess.h"
+#include "LogConfig.h"
+#include "Logging.h"
+#include "ProcessLock.h"
+#include "ThreadPool.h"
+
+#ifdef _WIN32
+#include <Lmcons.h>
+#include <Shlobj.h>
+#include <deelevate.h>
+#endif
+
 #ifndef _WIN32
 #include <poll.h>
 #endif
 
+using watchman::ChildProcess;
+using watchman::FileDescriptor;
+using Options = ChildProcess::Options;
+using namespace watchman;
+
 static int show_help = 0;
 static int show_version = 0;
+static int enable_tcp = 0;
+static std::string tcp_host;
 static enum w_pdu_type server_pdu = is_bser;
 static enum w_pdu_type output_pdu = is_json_pretty;
-static char *server_encoding = NULL;
-static char *output_encoding = NULL;
-static char *test_state_dir = NULL;
-static char *sock_name = NULL;
-char *log_name = NULL;
-static char *pid_file = NULL;
-char *watchman_state_file = NULL;
-static char **daemon_argv = NULL;
-const char *watchman_tmp_dir = NULL;
+static uint32_t server_capabilities = 0;
+static uint32_t output_capabilities = 0;
+static std::string server_encoding;
+static std::string output_encoding;
+static std::string test_state_dir;
+static std::string pid_file;
+static char** daemon_argv = NULL;
 static int persistent = 0;
-int dont_save_state = 0;
 static int foreground = 0;
 static int no_pretty = 0;
 static int no_spawn = 0;
 static int no_local = 0;
+static int no_site_spawner = 0;
 #ifndef _WIN32
 static int inetd_style = 0;
-static struct sockaddr_un un;
 #endif
+static struct sockaddr_un un;
 static int json_input_arg = 0;
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
 
-static const char *compute_user_name(void);
-static void compute_file_name(char **strp, const char *user, const char *suffix,
-                              const char *what);
+static std::string compute_user_name();
+static void compute_file_name(
+    std::string& str,
+    const std::string& user,
+    const char* suffix,
+    const char* what);
 
-static bool lock_pidfile(void) {
-#if !defined(USE_GIMLI) && !defined(_WIN32)
-  struct flock lock;
-  pid_t mypid;
-  int fd;
-
+namespace {
+const std::string& get_pid_file() {
   // We defer computing this path until we're in the server context because
   // eager evaluation can trigger integration test failures unless all clients
   // are aware of both the pidfile and the sockpath being used in the tests.
-  compute_file_name(&pid_file, compute_user_name(), "pid", "pidfile");
+  compute_file_name(pid_file, compute_user_name(), "pid", "pidfile");
+  return pid_file;
+}
+} // namespace
 
-  mypid = getpid();
-  memset(&lock, 0, sizeof(lock));
-  lock.l_type = F_WRLCK;
-  lock.l_start = 0;
-  lock.l_whence = SEEK_SET;
-  lock.l_len = 0;
+/**
+ * Log and fatal if Watchman was started with a low priority, which can cause a
+ * poor experience, as Watchman is unable to keep up with the filesystem's
+ * change notifications, triggering recrawls.
+ */
+void detect_low_process_priority() {
+#ifndef _WIN32
+  // Since `-1` is a valid nice level, in order to detect an
+  // error we clear errno first and then test whether it is
+  // non-zero after we have retrieved the nice value.
+  errno = 0;
+  auto nice_value = nice(0);
+  folly::checkPosixError(errno, "failed to get `nice` value");
 
-  fd = open(pid_file, O_RDWR | O_CREAT, 0644);
-  if (fd == -1) {
-    w_log(W_LOG_ERR, "Failed to open pidfile %s for write: %s\n", pid_file,
-          strerror(errno));
-    return false;
+  if (nice_value > cfg_get_int("min_acceptable_nice_value", 0)) {
+    log(watchman::FATAL,
+        "Watchman is running at a lower than normal priority. Since that "
+        "results in poor performance that is otherwise very difficult to "
+        "trace, diagnose and debug, Watchman is refusing to start.\n");
   }
-  // Ensure that no children inherit the locked pidfile descriptor
-  w_set_cloexec(fd);
-
-  if (fcntl(fd, F_SETLK, &lock) != 0) {
-    char pidstr[32];
-    int len;
-
-    len = read(fd, pidstr, sizeof(pidstr) - 1);
-    pidstr[len] = '\0';
-
-    w_log(W_LOG_ERR, "Failed to lock pidfile %s: process %s owns it: %s\n",
-          pid_file, pidstr, strerror(errno));
-    return false;
-  }
-
-  // Replace contents of the pidfile with our pid string
-  if (ftruncate(fd, 0)) {
-    w_log(W_LOG_ERR, "Failed to truncate pidfile %s: %s\n",
-        pid_file, strerror(errno));
-    return false;
-  }
-
-  dprintf(fd, "%d", mypid);
-  fsync(fd);
-
-  /* We are intentionally not closing the fd and intentionally not storing
-   * a reference to it anywhere: the intention is that it remain locked
-   * for the rest of the lifetime of our process.
-   * close(fd); // NOPE!
-   */
-  return true;
-#else
-  // ze-googles, they do nothing!!
-  return true;
 #endif
 }
 
-static void run_service(void)
-{
-  int fd;
-  bool res;
-
+[[noreturn]] static void run_service(ProcessLock::Handle&&) {
 #ifndef _WIN32
   // Before we redirect stdin/stdout to the log files, move any inetd-provided
   // socket to a different descriptor number.
   if (inetd_style) {
-    if (!w_listener_prep_inetd()) {
-      return;
-    }
+    w_listener_prep_inetd();
   }
 #endif
 
   // redirect std{in,out,err}
-  fd = open("/dev/null", O_RDONLY);
+  int fd = ::open("/dev/null", O_RDONLY);
   if (fd != -1) {
-    ignore_result(dup2(fd, STDIN_FILENO));
-    close(fd);
+    ignore_result(::dup2(fd, STDIN_FILENO));
+    ::close(fd);
   }
-  fd = open(log_name, O_WRONLY|O_APPEND|O_CREAT, 0600);
+  fd = open(log_name.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0600);
   if (fd != -1) {
-    ignore_result(dup2(fd, STDOUT_FILENO));
-    ignore_result(dup2(fd, STDERR_FILENO));
-    close(fd);
+    ignore_result(::dup2(fd, STDOUT_FILENO));
+    ignore_result(::dup2(fd, STDERR_FILENO));
+    ::close(fd);
   }
 
-  if (!lock_pidfile()) {
-    return;
-  }
+  // If we weren't attached to a tty, check this now that we've opened
+  // the log files so that we can log the problem there.
+  //
+  // This is unlikely to trip, as both foreground and daemonized execution
+  // check process priority prior.
+  detect_low_process_priority();
 
 #ifndef _WIN32
   /* we are the child, let's set things up */
@@ -141,7 +141,9 @@ static void run_service(void)
     char hostname[256];
     gethostname(hostname, sizeof(hostname));
     hostname[sizeof(hostname) - 1] = '\0';
-    w_log(W_LOG_ERR, "Watchman %s %s starting up on %s\n",
+    logf(
+        ERR,
+        "Watchman {} {} starting up on {}\n",
         PACKAGE_VERSION,
 #ifdef WATCHMAN_BUILD_INFO
         WATCHMAN_BUILD_INFO,
@@ -165,15 +167,18 @@ static void run_service(void)
   }
 #endif
 
-  watchman_watcher_init();
-  w_clockspec_init();
-  // Start the reaper before we load any state; the state may
-  // have triggers associated with it which may spawn processes
-  w_start_reaper();
+  watchman::getThreadPool().start(
+      cfg_get_int("thread_pool_worker_threads", 16),
+      cfg_get_int("thread_pool_max_items", 1024 * 1024));
+
+  ClockSpec::init();
   w_state_load();
-  res = w_start_listener(sock_name);
+  bool res = w_start_listener();
   w_root_free_watched_roots();
+  perf_shutdown();
   cfg_shutdown();
+
+  log(ERR, "Exiting from service with res=", res, "\n");
 
   if (res) {
     exit(0);
@@ -181,11 +186,11 @@ static void run_service(void)
   exit(1);
 }
 
-#ifndef _WIN32
 // close any random descriptors that we may have inherited,
 // leaving only the main stdio descriptors open, if we execute a
 // child process.
-static void close_random_fds(void) {
+static void close_random_fds() {
+#ifndef _WIN32
   struct rlimit limit;
   long open_max = 0;
   int max_fd;
@@ -219,13 +224,64 @@ static void close_random_fds(void) {
   for (max_fd = open_max; max_fd > STDERR_FILENO; --max_fd) {
     close(max_fd);
   }
-}
 #endif
+}
 
-#if !defined(USE_GIMLI) && !defined(_WIN32)
-static void daemonize(void)
-{
+[[noreturn]] static void run_service_in_foreground() {
+  detect_low_process_priority();
   close_random_fds();
+
+  auto& pid_file = get_pid_file();
+  auto processLock = ProcessLock::acquire(pid_file);
+  run_service(processLock.writePid(pid_file));
+}
+
+namespace {
+struct [[nodiscard]] SpawnResult {
+  enum Status {
+    Spawned,
+    FailedToLock,
+  };
+
+  SpawnResult() = delete;
+
+  /* implicit */ SpawnResult(Status s, std::string r = {})
+      : status{s}, reason{std::move(r)} {}
+
+  void exitIfFailed() {
+    if (status == FailedToLock) {
+      fprintf(stderr, "%s\n", reason.c_str());
+      exit(1);
+    }
+  }
+
+  Status status;
+
+  /**
+   * If status is not Spawned, then this contains the error message.
+   */
+  std::string reason;
+};
+} // namespace
+
+#ifndef _WIN32
+/**
+ * Forks and daemonizes, starting the Watchman service in the child.
+ */
+static SpawnResult run_service_as_daemon() {
+  detect_low_process_priority();
+  close_random_fds();
+
+  // Lock the pidfile before we daemonize so that errors can be detected
+  // and returned (for logging) before we drop stderr. This prevents failure to
+  // lock from causing the daemonize process to start and immediately exit with
+  // an error, making it hard to track down why a command isn't succeeding.
+  auto acquireResult = ProcessLock::tryAcquire(get_pid_file());
+  if (auto* reason = std::get_if<std::string>(&acquireResult)) {
+    return SpawnResult{SpawnResult::FailedToLock, *reason};
+  }
+
+  auto& processLock = std::get<ProcessLock>(acquireResult);
 
   // the double-fork-and-setsid trick establishes a
   // child process that runs in its own process group
@@ -235,7 +291,7 @@ static void daemonize(void)
     // The parent of the first fork is the client
     // process that is being run by the user, and
     // we want to allow that to continue.
-    return;
+    return SpawnResult::Spawned;
   }
   setsid();
   if (fork()) {
@@ -247,93 +303,43 @@ static void daemonize(void)
     _exit(0);
   }
 
-  // we are the child, let's set things up
-  run_service();
+  // We are the child. Let's populate the pid file and start listening on the
+  // socket.
+  run_service(processLock.writePid(get_pid_file()));
 }
 #endif
-
-#define MAX_DAEMON_ARGS 64
-static void append_argv(char **argv, char *item)
-{
-  int i;
-
-  for (i = 0; argv[i]; i++) {
-    ;
-  }
-  if (i + 1 >= MAX_DAEMON_ARGS) {
-    abort();
-  }
-
-  argv[i] = item;
-  argv[i+1] = NULL;
-}
 
 #ifdef _WIN32
-static void spawn_win32(void) {
+static SpawnResult spawn_win32() {
   char module_name[WATCHMAN_NAME_MAX];
   GetModuleFileName(NULL, module_name, sizeof(module_name));
-  char *argv[MAX_DAEMON_ARGS] = {
-    module_name,
-    (char*)"--foreground",
-    NULL
-  };
-  posix_spawn_file_actions_t actions;
-  posix_spawnattr_t attr;
-  pid_t pid;
-  int i;
 
-  for (i = 0; daemon_argv[i]; i++) {
-    append_argv(argv, daemon_argv[i]);
+  Options opts;
+  opts.setFlags(POSIX_SPAWN_SETPGROUP);
+  opts.open(STDIN_FILENO, "/dev/null", O_RDONLY, 0666);
+  opts.open(
+      STDOUT_FILENO, log_name.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+  opts.dup2(STDOUT_FILENO, STDERR_FILENO);
+  opts.chdir("/");
+
+  std::vector<w_string_piece> args{module_name, "--foreground"};
+  for (size_t i = 0; daemon_argv[i]; i++) {
+    args.push_back(daemon_argv[i]);
   }
 
-  posix_spawnattr_init(&attr);
-  posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_addopen(&actions,
-      STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-  posix_spawn_file_actions_addopen(&actions,
-      STDOUT_FILENO, log_name, O_WRONLY|O_CREAT|O_APPEND, 0600);
-  posix_spawn_file_actions_adddup2(&actions,
-      STDOUT_FILENO, STDERR_FILENO);
-  posix_spawnp(&pid, argv[0], &actions, &attr, argv, environ);
-  posix_spawnattr_destroy(&attr);
-  posix_spawn_file_actions_destroy(&actions);
-}
-#endif
-
-#ifdef USE_GIMLI
-static void spawn_via_gimli(void)
-{
-  char *argv[MAX_DAEMON_ARGS] = {
-    GIMLI_MONITOR_PATH,
-#ifdef WATCHMAN_STATE_DIR
-    (char*)"--trace-dir=" WATCHMAN_STATE_DIR "/traces",
-#endif
-    (char*)"--pidfile", pid_file,
-    (char*)"watchman",
-    (char*)"--foreground",
-    NULL
-  };
-  posix_spawn_file_actions_t actions;
-  posix_spawnattr_t attr;
-  pid_t pid;
-  int i;
-
-  for (i = 0; daemon_argv[i]; i++) {
-    append_argv(argv, daemon_argv[i]);
+  ChildProcess proc(args, std::move(opts));
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  if (proc.terminated()) {
+    logf(
+        ERR,
+        "Failed to spawn watchman server; it exited with code {}.\n"
+        "Check the log file at {} for more information\n",
+        proc.wait(),
+        log_name);
+    exit(1);
   }
-
-  close_random_fds();
-
-  posix_spawnattr_init(&attr);
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_addopen(&actions,
-      STDOUT_FILENO, log_name, O_WRONLY|O_CREAT|O_APPEND, 0600);
-  posix_spawn_file_actions_adddup2(&actions,
-      STDOUT_FILENO, STDERR_FILENO);
-  posix_spawnp(&pid, argv[0], &actions, &attr, argv, environ);
-  posix_spawnattr_destroy(&attr);
-  posix_spawn_file_actions_destroy(&actions);
+  proc.disown();
+  return SpawnResult::Spawned;
 }
 #endif
 
@@ -341,121 +347,103 @@ static void spawn_via_gimli(void)
 // Spawn watchman via a site-specific spawn helper program.
 // We'll pass along any daemon-appropriate arguments that
 // we noticed during argument parsing.
-static void spawn_site_specific(const char *spawner)
-{
-  char *argv[MAX_DAEMON_ARGS] = {
-    (char*)spawner,
-    NULL
+static SpawnResult spawn_site_specific(const char* spawner) {
+  std::vector<w_string_piece> args{
+      spawner,
   };
-  posix_spawn_file_actions_t actions;
-  posix_spawnattr_t attr;
-  pid_t pid;
-  int i;
-  int res, err;
 
-  for (i = 0; daemon_argv[i]; i++) {
-    append_argv(argv, daemon_argv[i]);
+  for (size_t i = 0; daemon_argv[i]; i++) {
+    args.push_back(daemon_argv[i]);
   }
 
   close_random_fds();
 
-  posix_spawnattr_init(&attr);
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_addopen(&actions,
-      STDOUT_FILENO, log_name, O_WRONLY|O_CREAT|O_APPEND, 0600);
-  posix_spawn_file_actions_adddup2(&actions,
-      STDOUT_FILENO, STDERR_FILENO);
-  res = posix_spawnp(&pid, argv[0], &actions, &attr, argv, environ);
-  err = errno;
+  // Note that we're not setting up the output to go to the log files
+  // here.  This is intentional; we'd like any failures in the spawner
+  // to bubble up to the user as having things silently fail and get
+  // logged to the server log doesn't provide any obvious cues to the
+  // user about what went wrong.  Watchman will open and redirect output
+  // to its log files when it ultimately is launched and enters the
+  // run_service() function above.
+  // However, we do need to make sure that any output from both stdout
+  // and stderr goes to stderr of the end user.
+  Options opts;
+  opts.open(STDIN_FILENO, "/dev/null", O_RDONLY, 0666);
+  opts.dup2(STDERR_FILENO, STDOUT_FILENO);
+  opts.dup2(STDERR_FILENO, STDERR_FILENO);
 
-  posix_spawnattr_destroy(&attr);
-  posix_spawn_file_actions_destroy(&actions);
+  try {
+    ChildProcess proc(args, std::move(opts));
 
-  if (res) {
-    w_log(W_LOG_FATAL, "Failed to spawn watchman via `%s': %s\n", spawner,
-          strerror(err));
+    auto res = proc.wait();
+
+    if (WIFEXITED(res) && WEXITSTATUS(res) == 0) {
+      return SpawnResult::Spawned;
+    }
+
+    if (WIFEXITED(res)) {
+      log(FATAL, spawner, ": exited with status ", WEXITSTATUS(res), "\n");
+    } else if (WIFSIGNALED(res)) {
+      log(FATAL, spawner, ": signaled with ", WTERMSIG(res), "\n");
+    }
+    log(FATAL, spawner, ": failed to start, exit status ", res, "\n");
+
+  } catch (const std::exception& exc) {
+    log(FATAL,
+        "Failed to spawn watchman via `",
+        spawner,
+        "': ",
+        exc.what(),
+        "\n");
   }
 
-  if (waitpid(pid, &res, 0) == -1) {
-    w_log(W_LOG_FATAL, "Failed waiting for %s: %s\n", spawner, strerror(errno));
-  }
-
-  if (WIFEXITED(res) && WEXITSTATUS(res) == 0) {
-    return;
-  }
-
-  if (WIFEXITED(res)) {
-    w_log(W_LOG_FATAL, "%s: exited with status %d\n", spawner,
-          WEXITSTATUS(res));
-  } else if (WIFSIGNALED(res)) {
-    w_log(W_LOG_FATAL, "%s: signaled with %d\n", spawner, WTERMSIG(res));
-  }
-  w_log(W_LOG_ERR, "%s: failed to start, exit status %d\n", spawner, res);
+  return SpawnResult::Spawned;
 }
 #endif
 
 #ifdef __APPLE__
-static void spawn_via_launchd(void)
-{
+static SpawnResult spawn_via_launchd() {
   char watchman_path[WATCHMAN_NAME_MAX];
   uint32_t size = sizeof(watchman_path);
   char plist_path[WATCHMAN_NAME_MAX];
-  FILE *fp;
-  struct passwd *pw;
+  FILE* fp;
+  struct passwd* pw;
   uid_t uid;
-  char *argv[MAX_DAEMON_ARGS] = {
-    (char*)"/bin/launchctl",
-    (char*)"load",
-    (char*)"-F",
-    NULL
-  };
-  posix_spawnattr_t attr;
-  pid_t pid;
-  int res;
 
   close_random_fds();
 
   if (_NSGetExecutablePath(watchman_path, &size) == -1) {
-    w_log(W_LOG_ERR, "_NSGetExecutablePath: path too long; size %u\n", size);
-    abort();
+    log(FATAL, "_NSGetExecutablePath: path too long; size ", size, "\n");
   }
 
   uid = getuid();
   pw = getpwuid(uid);
   if (!pw) {
-    w_log(W_LOG_ERR, "getpwuid(%d) failed: %s.  I don't know who you are\n",
-        uid, strerror(errno));
-    abort();
+    log(FATAL,
+        "getpwuid(",
+        uid,
+        ") failed: ",
+        folly::errnoStr(errno),
+        ".  I don't know who you are\n");
   }
 
-  snprintf(plist_path, sizeof(plist_path),
-      "%s/Library/LaunchAgents", pw->pw_dir);
+  snprintf(
+      plist_path, sizeof(plist_path), "%s/Library/LaunchAgents", pw->pw_dir);
   // Best effort attempt to ensure that the agents dir exists.  We'll detect
   // and report the failure in the fopen call below.
   mkdir(plist_path, 0755);
-  snprintf(plist_path, sizeof(plist_path),
-      "%s/Library/LaunchAgents/com.github.facebook.watchman.plist", pw->pw_dir);
+  snprintf(
+      plist_path,
+      sizeof(plist_path),
+      "%s/Library/LaunchAgents/com.github.facebook.watchman.plist",
+      pw->pw_dir);
 
   if (access(plist_path, R_OK) == 0) {
     // Unload any that may already exist, as it is likely wrong
-    char *unload_argv[MAX_DAEMON_ARGS] = {
-      (char*)"/bin/launchctl",
-      (char*)"unload",
-      (char*)"-F",
-      NULL
-    };
-    append_argv(unload_argv, plist_path);
 
-    errno = posix_spawnattr_init(&attr);
-    if (errno != 0) {
-      w_log(W_LOG_FATAL, "posix_spawnattr_init: %s\n", strerror(errno));
-    }
-
-    res = posix_spawnp(&pid, unload_argv[0], NULL, &attr, unload_argv, environ);
-    if (res == 0) {
-      waitpid(pid, &res, 0);
-    }
-    posix_spawnattr_destroy(&attr);
+    ChildProcess unload_proc(
+        {"/bin/launchctl", "unload", "-F", plist_path}, Options());
+    unload_proc.wait();
 
     // Forcibly remove the plist.  In some cases it may have some attributes
     // set that prevent launchd from loading it.  This can happen where
@@ -465,128 +453,120 @@ static void spawn_via_launchd(void)
 
   fp = fopen(plist_path, "w");
   if (!fp) {
-    w_log(W_LOG_ERR, "Failed to open %s for write: %s\n",
-        plist_path, strerror(errno));
-    abort();
+    log(FATAL,
+        "Failed to open ",
+        plist_path,
+        " for write: ",
+        folly::errnoStr(errno),
+        "\n");
   }
 
-  compute_file_name(&pid_file, compute_user_name(), "pid", "pidfile");
+  compute_file_name(pid_file, compute_user_name(), "pid", "pidfile");
 
-  fprintf(fp,
-"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-"\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-"<plist version=\"1.0\">\n"
-"<dict>\n"
-"    <key>Label</key>\n"
-"    <string>com.github.facebook.watchman</string>\n"
-"    <key>Disabled</key>\n"
-"    <false/>\n"
-"    <key>ProgramArguments</key>\n"
-"    <array>\n"
-"        <string>%s</string>\n"
-"        <string>--foreground</string>\n"
-"        <string>--logfile=%s</string>\n"
-"        <string>--log-level=%d</string>\n"
-"        <string>--sockname=%s</string>\n"
-"        <string>--statefile=%s</string>\n"
-"        <string>--pidfile=%s</string>\n"
-"    </array>\n"
-"    <key>Sockets</key>\n"
-"    <dict>\n"
-"        <key>sock</key>\n" // coupled with get_listener_socket_from_launchd
-"        <dict>\n"
-"            <key>SockPathName</key>\n"
-"            <string>%s</string>\n"
-"            <key>SockPathMode</key>\n"
-"            <integer>%d</integer>\n"
-"        </dict>\n"
-"    </dict>\n"
-"    <key>KeepAlive</key>\n"
-"    <dict>\n"
-"        <key>Crashed</key>\n"
-"        <true/>\n"
-"    </dict>\n"
-"    <key>RunAtLoad</key>\n"
-"    <true/>\n"
-"    <key>EnvironmentVariables</key>\n"
-"    <dict>\n"
-"        <key>PATH</key>\n"
-"        <string><![CDATA[%s]]></string>\n"
-"    </dict>\n"
-"    <key>ProcessType</key>\n"
-"    <string>Interactive</string>\n"
-"    <key>Nice</key>\n"
-"    <integer>-5</integer>\n"
-"</dict>\n"
-"</plist>\n",
-    watchman_path, log_name, log_level, sock_name,
-    watchman_state_file, pid_file, sock_name, 0600,
-    getenv("PATH"));
+  auto plist_content = folly::to<std::string>(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+      "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+      "<plist version=\"1.0\">\n"
+      "<dict>\n"
+      "    <key>Label</key>\n"
+      "    <string>com.github.facebook.watchman</string>\n"
+      "    <key>Disabled</key>\n"
+      "    <false/>\n"
+      "    <key>ProgramArguments</key>\n"
+      "    <array>\n"
+      "        <string>",
+      watchman_path,
+      "</string>\n"
+      "        <string>--foreground</string>\n"
+      "        <string>--logfile=",
+      log_name,
+      "</string>\n"
+      "        <string>--log-level=",
+      log_level,
+      "</string>\n"
+      // TODO: switch from `--sockname` to `--unix-listener-path`
+      // after a grace period to allow for sane results if we
+      // roll back to an earlier version
+      "        <string>--sockname=",
+      get_unix_sock_name(),
+      "</string>\n"
+      "        <string>--statefile=",
+      watchman_state_file,
+      "</string>\n"
+      "        <string>--pidfile=",
+      pid_file,
+      "</string>\n"
+      "    </array>\n"
+      "    <key>KeepAlive</key>\n"
+      "    <dict>\n"
+      "        <key>Crashed</key>\n"
+      "        <true/>\n"
+      "    </dict>\n"
+      "    <key>RunAtLoad</key>\n"
+      "    <true/>\n"
+      "    <key>EnvironmentVariables</key>\n"
+      "    <dict>\n"
+      "        <key>PATH</key>\n"
+      "        <string><![CDATA[",
+      getenv("PATH"),
+      "]]></string>\n"
+      "    </dict>\n"
+      "    <key>ProcessType</key>\n"
+      "    <string>Interactive</string>\n"
+      "    <key>Nice</key>\n"
+      "    <integer>-5</integer>\n"
+      "</dict>\n"
+      "</plist>\n");
+  fwrite(plist_content.data(), 1, plist_content.size(), fp);
   fclose(fp);
   // Don't rely on umask, ensure we have the correct perms
   chmod(plist_path, 0644);
 
-  append_argv(argv, plist_path);
-
-  errno = posix_spawnattr_init(&attr);
-  if (errno != 0) {
-    w_log(W_LOG_FATAL, "posix_spawnattr_init: %s\n", strerror(errno));
-  }
-
-  res = posix_spawnp(&pid, argv[0], NULL, &attr, argv, environ);
-  if (res) {
-    w_log(W_LOG_FATAL, "Failed to spawn watchman via launchd: %s\n",
-        strerror(errno));
-  }
-  posix_spawnattr_destroy(&attr);
-
-  if (waitpid(pid, &res, 0) == -1) {
-    w_log(W_LOG_FATAL, "Failed waiting for launchctl load: %s\n",
-        strerror(errno));
-  }
+  ChildProcess load_proc(
+      {"/bin/launchctl", "load", "-F", plist_path}, Options());
+  auto res = load_proc.wait();
 
   if (WIFEXITED(res) && WEXITSTATUS(res) == 0) {
-    return;
+    return SpawnResult::Spawned;
   }
 
   // Most likely cause is "headless" operation with no GUI context
   if (WIFEXITED(res)) {
-    w_log(W_LOG_ERR, "launchctl: exited with status %d\n", WEXITSTATUS(res));
+    logf(ERR, "launchctl: exited with status {}\n", WEXITSTATUS(res));
   } else if (WIFSIGNALED(res)) {
-    w_log(W_LOG_ERR, "launchctl: signaled with %d\n", WTERMSIG(res));
+    logf(ERR, "launchctl: signaled with {}\n", WTERMSIG(res));
   }
-  w_log(W_LOG_ERR, "Falling back to daemonize\n");
-  daemonize();
+  logf(ERR, "Falling back to daemonize\n");
+  return run_service_as_daemon();
 }
 #endif
 
-static void parse_encoding(const char *enc, enum w_pdu_type *pdu)
-{
-  if (!enc) {
+static void parse_encoding(const std::string& enc, enum w_pdu_type* pdu) {
+  if (enc.empty()) {
     return;
   }
-  if (!strcmp(enc, "json")) {
+  if (enc == "json") {
     *pdu = is_json_compact;
     return;
   }
-  if (!strcmp(enc, "bser")) {
+  if (enc == "bser") {
     *pdu = is_bser;
     return;
   }
-  if (!strcmp(enc, "bser-v2")) {
+  if (enc == "bser-v2") {
     *pdu = is_bser_v2;
     return;
   }
-  w_log(W_LOG_ERR, "Invalid encoding '%s', use one of json, bser or bser-v2\n",
-      enc);
+  log(ERR, "Invalid encoding '", enc, "', use one of json, bser or bser-v2\n");
   exit(EX_USAGE);
 }
 
-static const char *get_env_with_fallback(const char *name1,
-    const char *name2, const char *fallback)
-{
-  const char *val;
+static const char* get_env_with_fallback(
+    const char* name1,
+    const char* name2,
+    const char* fallback) {
+  const char* val;
 
   val = getenv(name1);
   if (!val || *val == 0) {
@@ -599,230 +579,324 @@ static const char *get_env_with_fallback(const char *name1,
   return val;
 }
 
-static void compute_file_name(char **strp,
-    const char *user,
-    const char *suffix,
-    const char *what)
-{
-  char *str = NULL;
-
-  str = *strp;
-
-  if (!str) {
-    /* We'll put our various artifacts in a user specific dir
-     * within the state dir location */
-    char *state_dir = NULL;
-    const char *state_parent = test_state_dir ? test_state_dir :
-#ifdef WATCHMAN_STATE_DIR
-          WATCHMAN_STATE_DIR
-#else
-          watchman_tmp_dir
-#endif
-          ;
-
-    ignore_result(asprintf(&state_dir, "%s%c%s-state",
-          state_parent,
-          WATCHMAN_DIR_SEP,
-          user));
-
-    if (!state_dir) {
-      w_log(W_LOG_ERR, "out of memory computing %s\n", what);
-      exit(1);
-    }
-
-    if (mkdir(state_dir, 0700) == 0 || errno == EEXIST) {
+static void verify_dir_ownership(const std::string& state_dir) {
 #ifndef _WIN32
-      // verify ownership
-      struct stat st;
-      DIR *dirp;
-      int dir_fd;
-      int ret = 0;
-      uid_t euid = geteuid();
-      // TODO: also allow a gid to be specified here
-      const char *sock_group_name = cfg_get_string(NULL, "sock_group", NULL);
-      // S_ISGID is set so that files inside this directory inherit the group
-      // name
-      mode_t dir_perms = cfg_get_perms(NULL, "sock_access",
-                                       false /* write bits */,
-                                       true /* execute bits */) | S_ISGID;
+  // verify ownership
+  struct stat st;
+  int dir_fd;
+  int ret = 0;
+  uid_t euid = geteuid();
+  // TODO: also allow a gid to be specified here
+  const char* sock_group_name = cfg_get_string("sock_group", nullptr);
+  // S_ISGID is set so that files inside this directory inherit the group
+  // name
+  mode_t dir_perms =
+      cfg_get_perms(
+          "sock_access", false /* write bits */, true /* execute bits */) |
+      S_ISGID;
 
-      dirp = opendir(state_dir);
-      if (!dirp) {
-        w_log(W_LOG_ERR, "opendir(%s): %s\n", state_dir, strerror(errno));
-        exit(1);
-      }
+  auto dirp = w_dir_open(
+      state_dir.c_str(), false /* don't need strict symlink rules */);
 
-      dir_fd = dirfd(dirp);
-      if (dir_fd == -1) {
-        w_log(W_LOG_ERR, "dirfd(%s): %s\n", state_dir, strerror(errno));
-        goto bail;
-      }
-
-      if (fstat(dir_fd, &st) != 0) {
-        w_log(W_LOG_ERR, "fstat(%s): %s\n", state_dir, strerror(errno));
-        ret = 1;
-        goto bail;
-      }
-      if (euid != st.st_uid) {
-        w_log(W_LOG_ERR,
-            "the owner of %s is uid %d and doesn't match your euid %d\n",
-            state_dir, st.st_uid, euid);
-        ret = 1;
-        goto bail;
-      }
-      if (st.st_mode & 0022) {
-        w_log(W_LOG_ERR,
-            "the permissions on %s allow others to write to it. "
-            "Verify that you own the contents and then fix its "
-            "permissions by running `chmod 0700 %s`\n",
-            state_dir,
-            state_dir);
-        ret = 1;
-        goto bail;
-      }
-
-      if (sock_group_name) {
-        struct group *sock_group;
-        // This explicit errno statement is necessary to distinguish between the
-        // group not existing and an error.
-        errno = 0;
-        sock_group = getgrnam(sock_group_name);
-        if (!sock_group) {
-          if (errno == 0) {
-            w_log(W_LOG_ERR, "group '%s' does not exist", sock_group_name);
-          } else {
-            w_log(W_LOG_ERR, "getting gid for '%s' failed: %s", sock_group_name,
-                  strerror(errno));
-          }
-          ret = 1;
-          goto bail;
-        }
-
-        if (fchown(dir_fd, -1, sock_group->gr_gid) == -1) {
-          w_log(W_LOG_ERR, "setting up group '%s' failed: %s", sock_group_name,
-                strerror(errno));
-          ret = 1;
-          goto bail;
-        }
-      }
-
-      // Depending on group and world accessibility, change permissions on the
-      // directory. We can't leave the directory open and set permissions on the
-      // socket because not all POSIX systems respect permissions on UNIX domain
-      // sockets, but all POSIX systems respect permissions on the containing
-      // directory.
-      w_log(W_LOG_DBG, "Setting permissions on state dir to 0%o", dir_perms);
-      if (fchmod(dir_fd, dir_perms) == -1) {
-        w_log(W_LOG_ERR, "fchmod(%s, %#o): %s\n", state_dir, dir_perms,
-              strerror(errno));
-        ret = 1;
-        goto bail;
-      }
-
-    bail:
-      closedir(dirp);
-      if (ret) {
-        exit(ret);
-      }
-#endif
-    } else {
-      w_log(W_LOG_ERR, "while computing %s: failed to create %s: %s\n", what,
-            state_dir, strerror(errno));
-      exit(1);
-    }
-
-    ignore_result(asprintf(&str, "%s%c%s",
-          state_dir, WATCHMAN_DIR_SEP, suffix));
-
-    if (!str) {
-      w_log(W_LOG_ERR, "out of memory computing %s", what);
-      abort();
-    }
-
-    free(state_dir);
+  dir_fd = dirp->getFd();
+  if (dir_fd == -1) {
+    log(ERR, "dirfd(", state_dir, "): ", folly::errnoStr(errno), "\n");
+    goto bail;
   }
 
-#ifndef _WIN32
-  if (str[0] != '/') {
-    w_log(W_LOG_ERR, "invalid %s: %s", what, str);
-    abort();
+  if (fstat(dir_fd, &st) != 0) {
+    log(ERR, "fstat(", state_dir, "): ", folly::errnoStr(errno), "\n");
+    ret = 1;
+    goto bail;
+  }
+  if (euid != st.st_uid) {
+    log(ERR,
+        "the owner of ",
+        state_dir,
+        " is uid ",
+        st.st_uid,
+        " and doesn't match your euid ",
+        euid,
+        "\n");
+    ret = 1;
+    goto bail;
+  }
+  if (st.st_mode & 0022) {
+    log(ERR,
+        "the permissions on ",
+        state_dir,
+        " allow others to write to it. "
+        "Verify that you own the contents and then fix its "
+        "permissions by running `chmod 0700 '",
+        state_dir,
+        "'`\n");
+    ret = 1;
+    goto bail;
+  }
+
+  if (sock_group_name) {
+    const struct group* sock_group = w_get_group(sock_group_name);
+    if (!sock_group) {
+      ret = 1;
+      goto bail;
+    }
+
+    if (fchown(dir_fd, -1, sock_group->gr_gid) == -1) {
+      log(ERR,
+          "setting up group '",
+          sock_group_name,
+          "' failed: ",
+          folly::errnoStr(errno),
+          "\n");
+      ret = 1;
+      goto bail;
+    }
+  }
+
+  // Depending on group and world accessibility, change permissions on the
+  // directory. We can't leave the directory open and set permissions on the
+  // socket because not all POSIX systems respect permissions on UNIX domain
+  // sockets, but all POSIX systems respect permissions on the containing
+  // directory.
+  logf(DBG, "Setting permissions on state dir to {:o}\n", dir_perms);
+  if (fchmod(dir_fd, dir_perms) == -1) {
+    logf(
+        ERR,
+        "fchmod({}, {:o}): {}\n",
+        state_dir,
+        dir_perms,
+        folly::errnoStr(errno));
+    ret = 1;
+    goto bail;
+  }
+
+bail:
+  if (ret) {
+    exit(ret);
   }
 #endif
-
-  *strp = str;
 }
 
-static const char *compute_user_name(void) {
-  const char *user = get_env_with_fallback("USER", "LOGNAME", NULL);
 #ifdef _WIN32
-  static char user_buf[256];
+static std::string get_watchman_appdata_path() {
+  PWSTR local_app_data = nullptr;
+  auto res =
+      SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local_app_data);
+  if (res != S_OK) {
+    logf(
+        FATAL,
+        "SHGetKnownFolderPath FOLDERID_LocalAppData failed: {}\n",
+        win32_strerror(res));
+  }
+  SCOPE_EXIT {
+    CoTaskMemFree(local_app_data);
+  };
+  // Perform path mapping from wide string to our preferred UTF8
+  w_string temp_location(local_app_data, wcslen(local_app_data));
+  // and use the watchman subdir of LOCALAPPDATA
+  auto watchmanDir = folly::to<std::string>(temp_location, "/watchman");
+  if (mkdir(watchmanDir.c_str(), 0700) == 0 || errno == EEXIST) {
+    return watchmanDir;
+  }
+  logf(
+      ERR,
+      "failed to create directory {}: {}\n",
+      watchmanDir,
+      folly::errnoStr(errno));
+  exit(1);
+}
+
+static const std::string& cached_watchman_appdata_path() {
+  static std::string path = get_watchman_appdata_path();
+  return path;
+}
 #endif
 
-  if (!user) {
+static std::string compute_per_user_state_dir(const std::string& user) {
+  if (!test_state_dir.empty()) {
+    return folly::to<std::string>(test_state_dir, "/", user, "-state");
+  }
+
 #ifdef _WIN32
-    DWORD size = sizeof(user_buf);
-    if (GetUserName(user_buf, &size)) {
-      user_buf[size] = 0;
-      user = user_buf;
-    } else {
-      w_log(W_LOG_FATAL, "GetUserName failed: %s. I don't know who you are\n",
-          win32_strerror(GetLastError()));
-    }
+  return cached_watchman_appdata_path();
 #else
+  auto state_parent =
+#ifdef WATCHMAN_STATE_DIR
+      WATCHMAN_STATE_DIR
+#else
+      watchman_tmp_dir.c_str()
+#endif
+      ;
+  return folly::to<std::string>(state_parent, "/", user, "-state");
+#endif
+}
+
+static void compute_file_name(
+    std::string& str,
+    const std::string& user,
+    const char* suffix,
+    const char* what) {
+  bool str_computed = false;
+  if (str.empty()) {
+    str_computed = true;
+    /* We'll put our various artifacts in a user specific dir
+     * within the state dir location */
+    auto state_dir = compute_per_user_state_dir(user);
+
+    if (mkdir(state_dir.c_str(), 0700) == 0 || errno == EEXIST) {
+      verify_dir_ownership(state_dir.c_str());
+    } else {
+      log(ERR,
+          "while computing ",
+          what,
+          ": failed to create ",
+          state_dir,
+          ": ",
+          folly::errnoStr(errno),
+          "\n");
+      exit(1);
+    }
+
+    str = folly::to<std::string>(state_dir, "/", suffix);
+  }
+#ifndef _WIN32
+  if (!w_string_piece(str).pathIsAbsolute()) {
+    log(FATAL,
+        what,
+        " must be an absolute file path but ",
+        str,
+        " was",
+        str_computed ? " computed." : " provided.",
+        "\n");
+  }
+#endif
+}
+
+static std::string compute_user_name() {
+#ifdef _WIN32
+  // We don't trust the environment on win32 because in some situations
+  // the environment may contain the domain name like `WORKGROUP\user`
+  // which can confuse some path construction we do later on.
+  WCHAR userW[1 + UNLEN];
+  DWORD size = static_cast<DWORD>(std::size(userW));
+  if (GetUserNameW(userW, &size) && size > 0) {
+    // Constructing a w_string from a WCHAR* will convert to UTF-8
+    w_string user(userW, size);
+    return folly::to<std::string>(user);
+  }
+
+  log(FATAL,
+      "GetUserName failed: ",
+      win32_strerror(GetLastError()),
+      ". I don't know who you are!?\n");
+#else
+  const char* user = get_env_with_fallback("USER", "LOGNAME", NULL);
+
+  if (!user) {
     uid_t uid = getuid();
-    struct passwd *pw;
+    struct passwd* pw;
 
     pw = getpwuid(uid);
     if (!pw) {
-      w_log(W_LOG_FATAL, "getpwuid(%d) failed: %s. I don't know who you are\n",
-          uid, strerror(errno));
+      log(FATAL,
+          "getpwuid(",
+          uid,
+          ") failed: ",
+          folly::errnoStr(errno),
+          ". I don't know who you are\n");
     }
 
     user = pw->pw_name;
-#endif
 
     if (!user) {
-      w_log(W_LOG_ERR, "watchman requires that you set $USER in your env\n");
-      abort();
+      log(FATAL, "watchman requires that you set $USER in your env\n");
     }
   }
 
   return user;
+#endif
 }
-
-static void setup_sock_name(void)
-{
-  const char *user = compute_user_name();
-
-  watchman_tmp_dir = get_env_with_fallback("TMPDIR", "TMP", "/tmp");
 
 #ifdef _WIN32
-  if (!sock_name) {
-    asprintf(&sock_name, "\\\\.\\pipe\\watchman-%s", user);
+bool initialize_winsock() {
+  WSADATA wsaData;
+  if ((WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) ||
+      (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2)) {
+    return false;
   }
-#else
-  compute_file_name(&sock_name, user, "sock", "sockname");
-#endif
-  compute_file_name(&watchman_state_file, user, "state", "statefile");
-  compute_file_name(&log_name, user, "log", "logname");
-#ifdef USE_GIMLI
-  compute_file_name(&pid_file, user, "pid", "pidfile");
-#endif
-
-#ifndef _WIN32
-  un.sun_family = PF_LOCAL;
-  strcpy(un.sun_path, sock_name);
-
-  if (strlen(sock_name) >= sizeof(un.sun_path) - 1) {
-    w_log(W_LOG_ERR, "%s: path is too long\n",
-        sock_name);
-    abort();
-  }
-#endif
+  return true;
 }
 
-static bool should_start(int err)
-{
+bool initialize_uds() {
+  if (!initialize_winsock()) {
+    log(DBG, "unable to initialize winsock, disabling UDS support\n");
+  }
+
+  // Test if UDS support is present
+  FileDescriptor fd(
+      ::socket(PF_LOCAL, SOCK_STREAM, 0), FileDescriptor::FDType::Socket);
+
+  bool fd_initialized = (bool)fd;
+
+  if (!fd_initialized) {
+    log(DBG, "unable to create UNIX domain socket, disabling UDS support\n");
+    return false;
+  }
+
+  return true;
+}
+#endif
+
+static void setup_sock_name() {
+#ifdef _WIN32
+  if (!initialize_uds()) {
+    // if we can't create UNIX domain socket, disable it.
+    disable_unix_socket = true;
+  }
+#endif
+
+  auto user = compute_user_name();
+
+#ifdef _WIN32
+  if (!test_state_dir.empty()) {
+    watchman_tmp_dir = test_state_dir;
+  } else {
+    watchman_tmp_dir = cached_watchman_appdata_path();
+  }
+#else
+  watchman_tmp_dir = get_env_with_fallback("TMPDIR", "TMP", "/tmp");
+#endif
+
+#ifdef _WIN32
+  // On Windows, if an application uses --sockname to override the named
+  // pipe path so that it can isolate its watchman integration tests,
+  // but doesn't also specify --unix-listener-path then we need to
+  // take care to prevent using the default unix domain path which would
+  // otherwise break their isolation.
+  // If either option is specified without the other, then we disable
+  // the use of the other.
+  if (!named_pipe_path.empty() || !unix_sock_name.empty()) {
+    disable_named_pipe = named_pipe_path.empty();
+    disable_unix_socket = unix_sock_name.empty();
+  }
+
+  if (named_pipe_path.empty()) {
+    named_pipe_path = folly::to<std::string>("\\\\.\\pipe\\watchman-", user);
+  }
+#endif
+  compute_file_name(unix_sock_name, user, "sock", "sockname");
+
+  compute_file_name(watchman_state_file, user, "state", "statefile");
+  compute_file_name(log_name, user, "log", "logfile");
+
+  if (unix_sock_name.size() >= sizeof(un.sun_path) - 1) {
+    log(FATAL, unix_sock_name, ": path is too long\n");
+  }
+  un.sun_family = PF_LOCAL;
+  memcpy(un.sun_path, unix_sock_name.c_str(), unix_sock_name.size() + 1);
+}
+
+static bool should_start(int err) {
   if (err == ECONNREFUSED) {
     return true;
   }
@@ -832,109 +906,229 @@ static bool should_start(int err)
   return false;
 }
 
-static bool try_command(json_t *cmd, int timeout)
-{
-  w_stm_t client = NULL;
-  w_jbuffer_t buffer;
-  w_jbuffer_t output_pdu_buffer;
-  int err;
-
-  client = w_stm_connect(sock_name, timeout * 1000);
-  if (client == NULL) {
+static bool try_command(json_t* cmd, int timeout) {
+  auto client = w_stm_connect(timeout * 1000);
+  if (!client) {
     return false;
   }
 
+  // Start in a well-defined non-blocking state as we can't tell
+  // what mode we're in on windows until we've set it to something
+  // explicitly at least once before!
+  client->setNonBlock(false);
+
   if (!cmd) {
-    w_stm_close(client);
     return true;
   }
 
-  w_json_buffer_init(&buffer);
+  w_jbuffer_t buffer;
+  w_jbuffer_t output_pdu_buffer;
 
   // Send command
-  if (!w_ser_write_pdu(server_pdu, &buffer, client, cmd)) {
-    err = errno;
-    w_log(W_LOG_ERR, "error sending PDU to server\n");
-    w_json_buffer_free(&buffer);
-    w_stm_close(client);
+  if (!buffer.pduEncodeToStream(
+          server_pdu, server_capabilities, cmd, client.get())) {
+    int err = errno;
+    logf(ERR, "error sending PDU to server\n");
     errno = err;
     return false;
   }
 
-  w_json_buffer_reset(&buffer);
-
-  w_json_buffer_init(&output_pdu_buffer);
+  buffer.clear();
 
   do {
-    if (!w_json_buffer_passthru(
-          &buffer, output_pdu, &output_pdu_buffer, client)) {
-      err = errno;
-      w_json_buffer_free(&buffer);
-      w_json_buffer_free(&output_pdu_buffer);
-      w_stm_close(client);
-      errno = err;
+    if (!buffer.passThru(
+            output_pdu,
+            output_capabilities,
+            &output_pdu_buffer,
+            client.get())) {
       return false;
     }
   } while (persistent);
-  w_json_buffer_free(&buffer);
-  w_json_buffer_free(&output_pdu_buffer);
-  w_stm_close(client);
 
   return true;
 }
 
 static struct watchman_getopt opts[] = {
-  { "help",     'h', "Show this help",
-    OPT_NONE,   &show_help, NULL, NOT_DAEMON },
+    {"help", 'h', "Show this help", OPT_NONE, &show_help, NULL, NOT_DAEMON},
 #ifndef _WIN32
-  { "inetd",    0,   "Spawning from an inetd style supervisor",
-    OPT_NONE,   &inetd_style, NULL, IS_DAEMON },
+    {"inetd",
+     0,
+     "Spawning from an inetd style supervisor",
+     OPT_NONE,
+     &inetd_style,
+     NULL,
+     IS_DAEMON},
 #endif
-  { "version",  'v', "Show version number",
-    OPT_NONE,   &show_version, NULL, NOT_DAEMON },
-  { "sockname", 'U', "Specify alternate sockname",
-    REQ_STRING, &sock_name, "PATH", IS_DAEMON },
-  { "logfile", 'o', "Specify path to logfile",
-    REQ_STRING, &log_name, "PATH", IS_DAEMON },
-  { "log-level", 0, "set the log level (0 = off, default is 1, verbose = 2)",
-    REQ_INT, &log_level, NULL, IS_DAEMON },
-#ifdef USE_GIMLI
-  { "pidfile", 0, "Specify path to gimli monitor pidfile",
-    REQ_STRING, &pid_file, "PATH", NOT_DAEMON },
+    {"no-site-spawner",
+     'S',
+     "Don't use the site or system spawner",
+     OPT_NONE,
+     &no_site_spawner,
+     NULL,
+     IS_DAEMON},
+    {"version",
+     'v',
+     "Show version number",
+     OPT_NONE,
+     &show_version,
+     NULL,
+     NOT_DAEMON},
+/* -U / --sockname  have legacy meaning; unix domain on unix,
+ * named pipe path on windows.  After we chose this assignment,
+ * Windows evolved unix domain support which muddies this.
+ * We need to preserve the sockname/U option here for backwards
+ * compatibility */
+#ifdef _WIN32
+    {"sockname",
+     'U',
+     "DEPRECATED: Specify alternate named pipe path (specifying this will"
+     " disable unix domain sockets unless `--unix-listener-path` is"
+     " specified)",
+     REQ_STRING,
+     &named_pipe_path,
+     "PATH",
+     IS_DAEMON},
 #else
-  { "pidfile", 0, "Specify path to pidfile",
-    REQ_STRING, &pid_file, "PATH", IS_DAEMON },
+    {"sockname",
+     'U',
+     "DEPRECATED: Specify alternate sockname. Use `--unix-listener-path` instead.",
+     REQ_STRING,
+     &unix_sock_name,
+     "PATH",
+     IS_DAEMON},
 #endif
-  { "persistent", 'p', "Persist and wait for further responses",
-    OPT_NONE, &persistent, NULL, NOT_DAEMON },
-  { "no-save-state", 'n', "Don't save state between invocations",
-    OPT_NONE, &dont_save_state, NULL, IS_DAEMON },
-  { "statefile", 0, "Specify path to file to hold watch and trigger state",
-    REQ_STRING, &watchman_state_file, "PATH", IS_DAEMON },
-  { "json-command", 'j', "Instead of parsing CLI arguments, take a single "
-    "json object from stdin",
-    OPT_NONE, &json_input_arg, NULL, NOT_DAEMON },
-  { "output-encoding", 0, "CLI output encoding. json (default) or bser",
-    REQ_STRING, &output_encoding, NULL, NOT_DAEMON },
-  { "server-encoding", 0, "CLI<->server encoding. bser (default) or json",
-    REQ_STRING, &server_encoding, NULL, NOT_DAEMON },
-  { "foreground", 'f', "Run the service in the foreground",
-    OPT_NONE, &foreground, NULL, NOT_DAEMON },
-  { "no-pretty", 0, "Don't pretty print JSON",
-    OPT_NONE, &no_pretty, NULL, NOT_DAEMON },
-  { "no-spawn", 0, "Don't try to start the service if it is not available",
-    OPT_NONE, &no_spawn, NULL, NOT_DAEMON },
-  { "no-local", 0, "When no-spawn is enabled, don't try to handle request"
-    " in client mode if service is unavailable",
-    OPT_NONE, &no_local, NULL, NOT_DAEMON },
-  // test-state-dir is for testing only and should not be used in production:
-  // instead, use the compile-time WATCHMAN_STATE_DIR option
-  { "test-state-dir", 0, NULL, REQ_STRING, &test_state_dir, "DIR", NOT_DAEMON },
-  { 0, 0, 0, OPT_NONE, 0, 0, 0 }
-};
+    {"named-pipe-path",
+     0,
+     "Specify alternate named pipe path",
+     REQ_STRING,
+     &named_pipe_path,
+     "PATH",
+     IS_DAEMON},
+    {"unix-listener-path",
+     'u',
+#ifdef _WIN32
+     "Specify alternate unix domain socket path (specifying this will disable"
+     " named pipes unless `--named-pipe-path` is specified)",
+#else
+     "Specify alternate unix domain socket path",
+#endif
+     REQ_STRING,
+     &unix_sock_name,
+     "PATH",
+     IS_DAEMON},
+    {"tcp-listener-enable",
+     't',
+     "Enable listening on TCP; see also tcp-listener-address and tcp-listener-port",
+     OPT_NONE,
+     &enable_tcp,
+     nullptr,
+     IS_DAEMON},
+    {"tcp-listener-address",
+     0,
+     "Specify in <address>:<port> the address to bind to and listen on when tcp-listener-enable is true",
+     REQ_STRING,
+     &tcp_host,
+     "ADDRESS",
+     IS_DAEMON},
+    {"logfile",
+     'o',
+     "Specify path to logfile",
+     REQ_STRING,
+     &log_name,
+     "PATH",
+     IS_DAEMON},
+    {"log-level",
+     0,
+     "set the log level (0 = off, default is 1, verbose = 2)",
+     REQ_INT,
+     &log_level,
+     NULL,
+     IS_DAEMON},
+    {"pidfile",
+     0,
+     "Specify path to pidfile",
+     REQ_STRING,
+     &pid_file,
+     "PATH",
+     IS_DAEMON},
+    {"persistent",
+     'p',
+     "Persist and wait for further responses",
+     OPT_NONE,
+     &persistent,
+     NULL,
+     NOT_DAEMON},
+    {"no-save-state",
+     'n',
+     "Don't save state between invocations",
+     OPT_NONE,
+     &dont_save_state,
+     NULL,
+     IS_DAEMON},
+    {"statefile",
+     0,
+     "Specify path to file to hold watch and trigger state",
+     REQ_STRING,
+     &watchman_state_file,
+     "PATH",
+     IS_DAEMON},
+    {"json-command",
+     'j',
+     "Instead of parsing CLI arguments, take a single "
+     "json object from stdin",
+     OPT_NONE,
+     &json_input_arg,
+     NULL,
+     NOT_DAEMON},
+    {"output-encoding",
+     0,
+     "CLI output encoding. json (default) or bser",
+     REQ_STRING,
+     &output_encoding,
+     NULL,
+     NOT_DAEMON},
+    {"server-encoding",
+     0,
+     "CLI<->server encoding. bser (default) or json",
+     REQ_STRING,
+     &server_encoding,
+     NULL,
+     NOT_DAEMON},
+    {"foreground",
+     'f',
+     "Run the service in the foreground",
+     OPT_NONE,
+     &foreground,
+     NULL,
+     NOT_DAEMON},
+    {"no-pretty",
+     0,
+     "Don't pretty print JSON",
+     OPT_NONE,
+     &no_pretty,
+     NULL,
+     NOT_DAEMON},
+    {"no-spawn",
+     0,
+     "Don't try to start the service if it is not available",
+     OPT_NONE,
+     &no_spawn,
+     NULL,
+     NOT_DAEMON},
+    {"no-local",
+     0,
+     "When no-spawn is enabled, don't try to handle request"
+     " in client mode if service is unavailable",
+     OPT_NONE,
+     &no_local,
+     NULL,
+     NOT_DAEMON},
+    // test-state-dir is for testing only and should not be used in production:
+    // instead, use the compile-time WATCHMAN_STATE_DIR option
+    {"test-state-dir", 0, NULL, REQ_STRING, &test_state_dir, "DIR", NOT_DAEMON},
+    {0, 0, 0, OPT_NONE, 0, 0, 0}};
 
-static void parse_cmdline(int *argcp, char ***argvp)
-{
+static void parse_cmdline(int* argcp, char*** argvp) {
   cfg_load_global_config_file();
   w_getopt(opts, argcp, argvp, &daemon_argv);
   if (show_help) {
@@ -944,52 +1138,70 @@ static void parse_cmdline(int *argcp, char ***argvp)
     printf("%s\n", PACKAGE_VERSION);
     exit(0);
   }
+  watchman::getLog().setStdErrLoggingLevel(
+      static_cast<enum watchman::LogLevel>(log_level));
   setup_sock_name();
   parse_encoding(server_encoding, &server_pdu);
   parse_encoding(output_encoding, &output_pdu);
-  if (!output_encoding) {
+  if (output_encoding.empty()) {
     output_pdu = no_pretty ? is_json_compact : is_json_pretty;
+  }
+
+  // Prevent integration tests that call the watchman cli from
+  // accidentally spawning a server.
+  if (getenv("WATCHMAN_NO_SPAWN")) {
+    no_spawn = true;
+  }
+
+  if (Configuration().getBool("tcp-listener-enable", false)) {
+    // hg requires the state-enter/state-leave commands, which are disabled over
+    // TCP by default since at present it is unauthenticated. This should be
+    // removed once TLS authentication is added to the TCP listener.
+    // TODO: When this code is removed, lookup() can be changed to return a
+    // const pointer.
+    lookup_command(w_string("state-enter"), CMD_DAEMON)->flags |=
+        CMD_ALLOW_ANY_USER;
+    lookup_command(w_string("state-leave"), CMD_DAEMON)->flags |=
+        CMD_ALLOW_ANY_USER;
   }
 }
 
-static json_t *build_command(int argc, char **argv)
-{
-  json_t *cmd;
-  int i;
-
+static json_ref build_command(int argc, char** argv) {
   // Read blob from stdin
   if (json_input_arg) {
-    json_error_t err;
+    auto err = json_error_t();
     w_jbuffer_t buf;
 
-    memset(&err, 0, sizeof(err));
-    w_json_buffer_init(&buf);
-    cmd = w_json_buffer_next(&buf, w_stm_stdin(), &err);
+    auto cmd = buf.decodeNext(w_stm_stdin(), &err);
 
     if (buf.pdu_type == is_bser) {
       // If they used bser for the input, select bser for output
       // unless they explicitly requested something else
-      if (!server_encoding) {
+      if (server_encoding.empty()) {
         server_pdu = is_bser;
       }
-      if (!output_encoding) {
+      if (output_encoding.empty()) {
         output_pdu = is_bser;
       }
     } else if (buf.pdu_type == is_bser_v2) {
       // If they used bser v2 for the input, select bser v2 for output
       // unless they explicitly requested something else
-      if (!server_encoding) {
+      if (server_encoding.empty()) {
         server_pdu = is_bser_v2;
       }
-      if (!output_encoding) {
+      if (output_encoding.empty()) {
         output_pdu = is_bser_v2;
       }
     }
 
-    w_json_buffer_free(&buf);
-
-    if (cmd == NULL) {
-      fprintf(stderr, "failed to parse command from stdin: %s\n",
+    if (!cmd) {
+      fprintf(
+          stderr,
+          "failed to parse command from stdin: "
+          "line %d, column %d, position %d: %s\n",
+          err.line,
+          err.column,
+          err.position,
           err.text);
       exit(1);
     }
@@ -1000,105 +1212,183 @@ static json_t *build_command(int argc, char **argv)
   // to verify that the service is up, starting it if
   // needed
   if (argc == 0) {
-    return NULL;
+    return nullptr;
   }
 
-  cmd = json_array();
-  for (i = 0; i < argc; i++) {
+  auto cmd = json_array();
+  for (int i = 0; i < argc; i++) {
     json_array_append_new(cmd, typed_string_to_json(argv[i], W_STRING_UNICODE));
   }
 
   return cmd;
 }
 
-const char *get_sock_name(void)
-{
-  return sock_name;
-}
+static SpawnResult try_spawn_watchman() {
+  // Every spawner that doesn't fork() this client process is susceptible to a
+  // race condition if `watchman shutdown-server` and `watchman <command>` are
+  // run in short order. The latter tries to spawn a daemon while the former is
+  // still shutting down, holding the pid lock, and this causes it to time out
+  // and fail. The solution would be to implement some kind of startup pipe that
+  // allows the server to indicate to the client when it's done starting up,
+  // communicating errors that are worthy of a retry.
 
-static void spawn_watchman(void) {
 #ifndef _WIN32
+  if (no_site_spawner) {
+    // The astute reader will notice this we're calling run_service_as_daemon()
+    // here and not the various other platform spawning functions in the block
+    // further below in this function.  This is deliberate: we want
+    // to do the most simple background running possible when the
+    // no_site_spawner flag is used.   In the future we plan to
+    // migrate the platform spawning functions to use the site_spawn
+    // functionality.
+    return run_service_as_daemon();
+  }
   // If we have a site-specific spawning requirement, then we'll
   // invoke that spawner rather than using any of the built-in
   // spawning functionality.
-  const char *site_spawn = cfg_get_string(NULL, "spawn_watchman_service", NULL);
+  const char* site_spawn = cfg_get_string("spawn_watchman_service", nullptr);
   if (site_spawn) {
-    spawn_site_specific(site_spawn);
-    return;
+    return spawn_site_specific(site_spawn);
   }
 #endif
 
-#ifdef USE_GIMLI
-  spawn_via_gimli();
-#elif defined(__APPLE__)
-  spawn_via_launchd();
+#if defined(__APPLE__)
+  return spawn_via_launchd();
 #elif defined(_WIN32)
-  spawn_win32();
+  return spawn_win32();
 #else
-  daemonize();
+  return run_service_as_daemon();
 #endif
 }
 
-int main(int argc, char **argv)
-{
-  bool ran;
-  json_t *cmd;
+static int inner_main(int argc, char** argv) {
+  // Since we don't fully integrate with folly, but may pull
+  // in dependencies that do, we need to perform a little bit
+  // of bootstrapping.  We don't want to run the full folly
+  // init today because it will interfere with our own signal
+  // handling.  In the future we will integrate this properly.
+  folly::SingletonVault::singleton()->registrationComplete();
+  SCOPE_EXIT {
+    folly::SingletonVault::singleton()->destroyInstances();
+  };
 
-  w_client_lock_init();
   parse_cmdline(&argc, &argv);
 
+#ifdef _WIN32
+  // On Windows its not possible to connect to elevated Watchman daemon from
+  // non-elevated processes. To ensure that Watchman daemon will always be
+  // accessible, deelevate by default if needed.
+  // Note watchman runs in some environments which require elevated
+  // permissions, so we can not always de-elevate.
+  if (Configuration().getBool("should_deelevate_on_startup", false)) {
+    deelevate_requires_normal_privileges();
+  }
+#endif
+
   if (foreground) {
-    run_service();
+    run_service_in_foreground();
     return 0;
   }
 
   w_set_thread_name("cli");
-  cmd = build_command(argc, argv);
-  preprocess_command(cmd, output_pdu);
+  auto cmd = build_command(argc, argv);
+  preprocess_command(cmd, output_pdu, output_capabilities);
 
-  ran = try_command(cmd, 0);
+  bool ran = try_command(cmd, 0);
   if (!ran && should_start(errno)) {
     if (no_spawn) {
       if (!no_local) {
         ran = try_client_mode_command(cmd, !no_pretty);
       }
     } else {
-      spawn_watchman();
-      ran = try_command(cmd, 10);
+      // Failed to run command. Try to spawn a daemon.
+
+      // Some site spawner scripts will asynchronously launch the service.
+      // When that happens we may encounter ECONNREFUSED.  We need to
+      // tolerate this, so we add some retries.
+      int attempts = 10;
+      std::chrono::milliseconds interval{10};
+
+      bool spawned = false;
+      while (true) {
+        if (!spawned) {
+          auto spawn_result = try_spawn_watchman();
+          switch (spawn_result.status) {
+            case SpawnResult::Spawned:
+              spawned = true;
+              break;
+            case SpawnResult::FailedToLock:
+              // Otherwise, it's possible another daemon is still shutting down,
+              // and we should try to start again next time. Alternatively,
+              // another daemon is starting up, and when it's ready, the command
+              // should succeed.
+              break;
+          }
+        }
+
+        ran = try_command(cmd, 10);
+        if (!ran && should_start(errno) && attempts-- > 0) {
+          /* sleep override */ std::this_thread::sleep_for(interval);
+          // 10 doublings of 10 ms is about 10 seconds total.
+          interval *= 2;
+          continue;
+        }
+        // Success or terminal failure
+        break;
+      }
     }
   }
-
-  json_decref(cmd);
 
   if (ran) {
     return 0;
   }
 
   if (!no_spawn) {
-    w_log(W_LOG_ERR, "unable to talk to your watchman on %s! (%s)\n",
-        sock_name, strerror(errno));
+    log(ERR,
+        "unable to talk to your watchman on ",
+        get_sock_name_legacy(),
+        "! (",
+        folly::errnoStr(errno),
+        ")\n");
 #ifdef __APPLE__
     if (getenv("TMUX")) {
-      w_log(W_LOG_ERR, "\n"
-"You may be hitting a tmux related session issue.\n"
-"An immediate workaround is to run:\n"
-"\n"
-"    watchman version\n"
-"\n"
-"just once, from *outside* your tmux session, to allow the launchd\n"
-"registration to be setup.  Once done, you can continue to access\n"
-"watchman from inside your tmux sessions as usual.\n"
-"\n"
-"Longer term, you may wish to install this tool:\n"
-"\n"
-"    https://github.com/ChrisJohnsen/tmux-MacOSX-pasteboard\n"
-"\n"
-"and configure tmux to use `reattach-to-user-namespace`\n"
-"when it launches your shell.\n");
+      logf(
+          ERR,
+          "\n"
+          "You may be hitting a tmux related session issue.\n"
+          "An immediate workaround is to run:\n"
+          "\n"
+          "    watchman version\n"
+          "\n"
+          "just once, from *outside* your tmux session, to allow the launchd\n"
+          "registration to be setup.  Once done, you can continue to access\n"
+          "watchman from inside your tmux sessions as usual.\n"
+          "\n"
+          "Longer term, you may wish to install this tool:\n"
+          "\n"
+          "    https://github.com/ChrisJohnsen/tmux-MacOSX-pasteboard\n"
+          "\n"
+          "and configure tmux to use `reattach-to-user-namespace`\n"
+          "when it launches your shell.\n");
     }
 #endif
   }
   return 1;
+}
+
+int main(int argc, char** argv) {
+  try {
+    return inner_main(argc, argv);
+  } catch (const std::exception& e) {
+    log(ERR,
+        "Uncaught C++ exception: ",
+        folly::exceptionStr(e).toStdString(),
+        "\n");
+    return 1;
+  } catch (...) {
+    log(ERR, "Uncaught C++ exception: ...\n");
+    return 1;
+  }
 }
 
 /* vim:ts=2:sw=2:et:

@@ -1,4 +1,4 @@
-# If you make a change to this file, make sure to also make it to .hgignore.
+/external
 buck-out
 buck-cache
 .buckd
@@ -20,7 +20,6 @@ buck-cache
 *.o
 /config.status
 /watchman
-/arcanist/.phutil_module_cache
 *.swp
 /compile
 /stamp-h1
@@ -28,6 +27,7 @@ buck-cache
 /thirdparty/jansson/jansson_config.h
 /compile
 /tests/*.t
+/*.t
 .dirstamp
 *.a
 /tests/integration/.watchman.*
@@ -50,6 +50,7 @@ buck-cache
 /tests/*.trs
 /a
 /arc
+/node/package-lock.json
 /node/node_modules
 /node/bser/node_modules
 /website/node_modules
@@ -71,3 +72,29 @@ Watchman.vcxproj
 *.sdf
 *.sln
 *.suo
+m4/
+.libs/
+*.lo
+*.la
+/tests/integration/cppclient.t
+libtool
+ltmain.sh
+cppclient/watchmanclient.pc
+/website/.jekyll-metadata
+/rust/**/Cargo.lock
+/rust/**/target/
+/CMakeCache.txt
+/CMakeFiles
+/*.cmake
+/Testing
+/install_manifest.txt
+*.vcxproj
+*.dir
+/x64
+/Release
+/Debug
+*.filters
+/.vs
+/external
+/common
+/eden

@@ -2,71 +2,69 @@
  * Licensed under the Apache License, Version 2.0 */
 
 #include "watchman.h"
+#include "InMemoryView.h"
+#include "watchman_error_category.h"
 
-// POSIX says open with O_NOFOLLOW should set errno to ELOOP if the path is a
-// symlink. However, FreeBSD (which ironically originated O_NOFOLLOW) sets it to
-// EMLINK.
-#ifdef __FreeBSD__
-#define ENOFOLLOWSYMLINK EMLINK
-#else
-#define ENOFOLLOWSYMLINK ELOOP
-#endif
+using namespace watchman;
 
-void handle_open_errno(struct write_locked_watchman_root *lock,
-                       struct watchman_dir *dir, struct timeval now,
-                       const char *syscall, int err, const char *reason) {
+void handle_open_errno(
+    watchman_root& root,
+    struct watchman_dir* dir,
+    std::chrono::system_clock::time_point now,
+    const char* syscall,
+    const std::error_code& err) {
   auto dir_name = dir->getFullPath();
   bool log_warning = true;
-  bool transient = false;
 
-  if (err == ENOENT || err == ENOTDIR || err == ENOFOLLOWSYMLINK) {
+  if (err == watchman::error_code::no_such_file_or_directory ||
+      err == watchman::error_code::not_a_directory ||
+      err == watchman::error_code::too_many_symbolic_link_levels) {
     log_warning = false;
-    transient = false;
-  } else if (err == EACCES || err == EPERM) {
+  } else if (err == watchman::error_code::permission_denied) {
     log_warning = true;
-    transient = false;
-  } else if (err == ENFILE || err == EMFILE) {
-    set_poison_state(dir_name, now, syscall, err, strerror(err));
+  } else if (err == watchman::error_code::system_limits_exceeded) {
+    set_poison_state(dir_name, now, syscall, err);
+    if (!root.failure_reason) {
+      root.failure_reason = w_string::build(*poisoned_reason.rlock());
+    }
     return;
   } else {
     log_warning = true;
-    transient = true;
   }
 
-  if (w_string_equal(dir_name, lock->root->root_path)) {
-    if (!transient) {
-      w_log(
-          W_LOG_ERR,
-          "%s(%s) -> %s. Root was deleted; cancelling watch\n",
-          syscall,
-          dir_name.c_str(),
-          reason ? reason : strerror(err));
-      w_root_cancel(lock->root);
-      return;
+  if (w_string_equal(dir_name, root.root_path)) {
+    auto warn = w_string::build(
+        syscall,
+        "(",
+        dir_name,
+        ") -> ",
+        err.message(),
+        ". Root is inaccessible; cancelling watch\n");
+    log(ERR, warn);
+    if (!root.failure_reason) {
+      root.failure_reason = warn;
     }
+    root.cancel();
+    return;
   }
 
-  auto warn = w_string::printf(
-      "%s(%s) -> %s. Marking this portion of the tree deleted",
+  auto warn = w_string::build(
       syscall,
-      dir_name.c_str(),
-      reason ? reason : strerror(err));
+      "(",
+      dir_name,
+      ") -> ",
+      err.message(),
+      ". Marking this portion of the tree deleted");
 
-  w_log(err == ENOENT ? W_LOG_DBG : W_LOG_ERR, "%s\n", warn.c_str());
+  watchman::log(
+      err == watchman::error_code::no_such_file_or_directory ? watchman::DBG
+                                                             : watchman::ERR,
+      warn,
+      "\n");
   if (log_warning) {
-    w_root_set_warning(lock, warn);
+    root.recrawlInfo.wlock()->warning = warn;
   }
-
-  stop_watching_dir(lock, dir);
-  w_root_mark_deleted(lock, dir, now, true);
 }
-
-void w_root_set_warning(
-    struct write_locked_watchman_root* lock,
-    const w_string& str) {
-  lock->root->warning = str;
-}
-
 
 /* vim:ts=2:sw=2:et:
  */

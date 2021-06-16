@@ -3,164 +3,160 @@
 
 #include "watchman.h"
 
+#include <memory>
+#include <vector>
+
 /* Basic boolean and compound expressions */
 
-struct w_expr_list {
-  bool allof;
-  size_t num;
-  w_query_expr **exprs;
+class NotExpr : public QueryExpr {
+  std::unique_ptr<QueryExpr> expr;
+
+ public:
+  explicit NotExpr(std::unique_ptr<QueryExpr> other_expr)
+      : expr(std::move(other_expr)) {}
+
+  EvaluateResult evaluate(w_query_ctx* ctx, FileResult* file) override {
+    auto res = expr->evaluate(ctx, file);
+    if (!res.has_value()) {
+      return res;
+    }
+    return !*res;
+  }
+
+  static std::unique_ptr<QueryExpr> parse(
+      w_query* query,
+      const json_ref& term) {
+    /* rigidly require ["not", expr] */
+    if (!term.isArray() || json_array_size(term) != 2) {
+      throw QueryParseError("must use [\"not\", expr]");
+    }
+
+    const auto& other = term.at(1);
+    auto other_expr = w_query_expr_parse(query, other);
+    return std::make_unique<NotExpr>(std::move(other_expr));
+  }
 };
 
-static void dispose_expr(void *data)
-{
-  auto expr = (w_query_expr*)data;
+W_TERM_PARSER("not", NotExpr::parse)
 
-  w_query_expr_delref(expr);
-}
-
-static bool eval_not(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  auto expr = (w_query_expr*)data;
-
-  return !w_query_expr_evaluate(expr, ctx, file);
-}
-
-static w_query_expr *not_parser(w_query *query, json_t *term)
-{
-  json_t *other;
-  w_query_expr *other_expr;
-
-  /* rigidly require ["not", expr] */
-  if (!json_is_array(term) || json_array_size(term) != 2) {
-    query->errmsg = strdup("must use [\"not\", expr]");
-    return NULL;
+class TrueExpr : public QueryExpr {
+ public:
+  EvaluateResult evaluate(w_query_ctx*, FileResult*) override {
+    return true;
   }
 
-  other = json_array_get(term, 1);
-  other_expr = w_query_expr_parse(query, other);
-  if (!other_expr) {
-    // other expr sets errmsg
-    return NULL;
+  static std::unique_ptr<QueryExpr> parse(w_query*, const json_ref&) {
+    return std::make_unique<TrueExpr>();
+  }
+};
+
+W_TERM_PARSER("true", TrueExpr::parse)
+
+class FalseExpr : public QueryExpr {
+ public:
+  EvaluateResult evaluate(w_query_ctx*, FileResult*) override {
+    return false;
   }
 
-  return w_query_expr_new(eval_not, dispose_expr, other_expr);
-}
-W_TERM_PARSER("not", not_parser)
+  static std::unique_ptr<QueryExpr> parse(w_query*, const json_ref&) {
+    return std::make_unique<FalseExpr>();
+  }
+};
 
-static bool eval_bool(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  unused_parameter(ctx);
-  unused_parameter(file);
-  return data ? true : false;
-}
+W_TERM_PARSER("false", FalseExpr::parse)
 
-static w_query_expr *true_parser(w_query *query, json_t *term)
-{
-  unused_parameter(term);
-  unused_parameter(query);
-  return w_query_expr_new(eval_bool, NULL, (void*)1);
-}
-W_TERM_PARSER("true", true_parser)
+class ListExpr : public QueryExpr {
+  bool allof;
+  std::vector<std::unique_ptr<QueryExpr>> exprs;
 
-static w_query_expr *false_parser(w_query *query, json_t *term)
-{
-  unused_parameter(term);
-  unused_parameter(query);
-  return w_query_expr_new(eval_bool, NULL, 0);
-}
-W_TERM_PARSER("false", false_parser)
+ public:
+  ListExpr(bool isAll, std::vector<std::unique_ptr<QueryExpr>> exprs)
+      : allof(isAll), exprs(std::move(exprs)) {}
 
-static bool eval_list(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  auto list = (w_expr_list*)data;
-  size_t i;
+  EvaluateResult evaluate(w_query_ctx* ctx, FileResult* file) override {
+    bool needData = false;
 
-  for (i = 0; i < list->num; i++) {
-    bool res = w_query_expr_evaluate(
-        list->exprs[i],
-        ctx, file);
+    for (auto& expr : exprs) {
+      auto res = expr->evaluate(ctx, file);
 
-    if (!res && list->allof) {
-      return false;
+      if (!res.has_value()) {
+        needData = true;
+      } else if (!*res) {
+        if (allof) {
+          // Return NoMatch even if we have needData set, as allof
+          // requires that all terms match and this one doesn't,
+          // so we can avoid loading the data for prior terms
+          // in this list
+          return false;
+        }
+      } else {
+        // Matched
+
+        if (!allof) {
+          // Similar to the condition above, we can short circuit loading
+          // other data if this one matches for the anyof case.
+          return true;
+        }
+      }
     }
 
-    if (res && !list->allof) {
-      return true;
+    if (needData) {
+      // We're not sure yet
+      return folly::none;
     }
-  }
-  return list->allof;
-}
-
-static void dispose_list(void *data)
-{
-  auto list = (w_expr_list*)data;
-  size_t i;
-
-  for (i = 0; i < list->num; i++) {
-    if (list->exprs[i]) {
-      w_query_expr_delref(list->exprs[i]);
-    }
+    return allof;
   }
 
-  free(list->exprs);
-  free(list);
-}
+  static std::unique_ptr<QueryExpr>
+  parse(w_query* query, const json_ref& term, bool allof) {
+    std::vector<std::unique_ptr<QueryExpr>> list;
 
-static w_query_expr *parse_list(w_query *query, json_t *term, bool allof)
-{
-  struct w_expr_list *list;
-  size_t i;
-
-  /* don't allow "allof" on its own */
-  if (!json_is_array(term) || json_array_size(term) < 2) {
-    query->errmsg = strdup("must use [\"allof\", expr...]");
-    return NULL;
-  }
-
-  list = (w_expr_list*)calloc(1, sizeof(*list));
-  if (!list) {
-    query->errmsg = strdup("out of memory");
-    return NULL;
-  }
-
-  list->allof = allof;
-  list->num = json_array_size(term) - 1;
-  list->exprs = (w_query_expr**)calloc(list->num, sizeof(list->exprs[0]));
-
-  for (i = 0; i < list->num; i++) {
-    w_query_expr *parsed;
-    json_t *exp = json_array_get(term, i + 1);
-
-    parsed = w_query_expr_parse(query, exp);
-    if (!parsed) {
-      // other expression parser sets errmsg
-      dispose_list(list);
-      return NULL;
+    /* don't allow "allof" on its own */
+    if (!term.isArray() || json_array_size(term) < 2) {
+      if (allof) {
+        throw QueryParseError("must use [\"allof\", expr...]");
+      }
+      throw QueryParseError("must use [\"anyof\", expr...]");
     }
 
-    list->exprs[i] = parsed;
+    auto n = json_array_size(term) - 1;
+    list.reserve(n);
+
+    for (size_t i = 0; i < n; i++) {
+      const auto& exp = term.at(i + 1);
+
+      auto op = allof ? AggregateOp::AllOf : AggregateOp::AnyOf;
+      auto parsed = w_query_expr_parse(query, exp);
+      if (list.empty()) {
+        list.emplace_back(std::move(parsed));
+      } else {
+        // Try to aggregate with previous expression
+        auto aggExpr = list.back().get()->aggregate(parsed.get(), op);
+        if (aggExpr) {
+          list.back() = std::move(aggExpr);
+        } else {
+          list.emplace_back(std::move(parsed));
+        }
+      }
+    }
+
+    return std::make_unique<ListExpr>(allof, std::move(list));
   }
 
-  return w_query_expr_new(eval_list, dispose_list, list);
-}
+  static std::unique_ptr<QueryExpr> parseAllOf(
+      w_query* query,
+      const json_ref& term) {
+    return parse(query, term, true);
+  }
+  static std::unique_ptr<QueryExpr> parseAnyOf(
+      w_query* query,
+      const json_ref& term) {
+    return parse(query, term, false);
+  }
+};
 
-static w_query_expr *anyof_parser(w_query *query, json_t *term)
-{
-  return parse_list(query, term, false);
-}
-W_TERM_PARSER("anyof", anyof_parser)
-
-static w_query_expr *allof_parser(w_query *query, json_t *term)
-{
-  return parse_list(query, term, true);
-}
-W_TERM_PARSER("allof", allof_parser)
+W_TERM_PARSER("anyof", ListExpr::parseAnyOf)
+W_TERM_PARSER("allof", ListExpr::parseAllOf)
 
 /* vim:ts=2:sw=2:et:
  */

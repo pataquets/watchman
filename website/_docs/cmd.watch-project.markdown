@@ -1,9 +1,10 @@
 ---
-id: cmd.watch-project
+pageid: cmd.watch-project
 title: watch-project
 layout: docs
 section: Commands
 permalink: docs/cmd/watch-project.html
+redirect_from: docs/cmd/watch-project/
 ---
 
 *Since 3.1.*
@@ -97,7 +98,7 @@ $ watchman watch-project ~/www/some/child/dir
 {
   "version": "3.0.1",
   "watch": "/Users/wez/www",
-  "relative_path": "www"
+  "relative_path": "some/child/dir"
 }
 ```
 

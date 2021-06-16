@@ -3,57 +3,82 @@
 
 #include "watchman.h"
 
-static bool eval_suffix(struct w_query_ctx *ctx,
-    struct watchman_file *file,
-    void *data)
-{
-  auto suffix = (w_string_t*)data;
+#include <memory>
 
-  unused_parameter(ctx);
+class SuffixExpr : public QueryExpr {
+  std::unordered_set<w_string> suffixSet_;
 
-  return w_string_suffix_match(w_file_get_name(file), suffix);
-}
+ public:
+  explicit SuffixExpr(std::unordered_set<w_string>&& suffixSet)
+      : suffixSet_(std::move(suffixSet)) {}
 
-static void dispose_suffix(void *data)
-{
-  auto suffix = (w_string_t*)data;
-
-  w_string_delref(suffix);
-}
-
-static w_query_expr *suffix_parser(w_query *query, json_t *term)
-{
-  const char *ignore, *suffix;
-  char *arg;
-  w_string_t *str;
-  int i, l;
-
-  if (json_unpack(term, "[s,s]", &ignore, &suffix) != 0) {
-    query->errmsg = strdup("must use [\"suffix\", \"suffixstring\"]");
-    return NULL;
+  EvaluateResult evaluate(struct w_query_ctx*, FileResult* file) override {
+    if (suffixSet_.size() < 3) {
+      // For small suffix sets, benchmarks indicated that iteration provides
+      // better performance since no suffix allocation is necessary.
+      for (auto const& suffix : suffixSet_) {
+        if (file->baseName().hasSuffix(suffix)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    auto suffix = file->baseName().asLowerCaseSuffix();
+    return suffix && (suffixSet_.find(suffix) != suffixSet_.end());
   }
 
-  arg = strdup(suffix);
-  if (!arg) {
-    query->errmsg = strdup("out of memory");
-    return NULL;
+  static std::unique_ptr<QueryExpr> parse(w_query*, const json_ref& term) {
+    std::unordered_set<w_string> suffixSet;
+
+    if (!term.isArray()) {
+      throw QueryParseError("Expected array for 'suffix' term");
+    }
+
+    if (json_array_size(term) > 2) {
+      throw QueryParseError("Invalid number of arguments for 'suffix' term");
+    }
+
+    const auto& suffix = term.at(1);
+
+    // Suffix match supports array or single suffix string
+    if (suffix.isArray()) {
+      suffixSet.reserve(json_array_size(suffix));
+      for (const auto& ele : suffix.array()) {
+        if (!ele.isString()) {
+          throw QueryParseError(
+              "Argument 2 to 'suffix' must be either a string or an array of string");
+        }
+        suffixSet.insert(json_to_w_string(ele).piece().asLowerCase());
+      }
+    } else if (suffix.isString()) {
+      suffixSet.insert(json_to_w_string(suffix).piece().asLowerCase());
+    } else {
+      throw QueryParseError(
+          "Argument 2 to 'suffix' must be either a string or an array of string");
+    }
+    return std::make_unique<SuffixExpr>(std::move(suffixSet));
   }
 
-  l = strlen_uint32(arg);
-  for (i = 0; i < l; i++) {
-    arg[i] = (char)tolower((uint8_t)arg[i]);
+  std::unique_ptr<QueryExpr> aggregate(
+      const QueryExpr* other,
+      const AggregateOp op) const override {
+    if (op != AggregateOp::AnyOf) {
+      return nullptr;
+    }
+    const SuffixExpr* otherExpr = dynamic_cast<const SuffixExpr*>(other);
+    if (otherExpr == nullptr) {
+      return nullptr;
+    }
+    std::unordered_set<w_string> suffixSet;
+    suffixSet.reserve(suffixSet_.size() + otherExpr->suffixSet_.size());
+    suffixSet.insert(
+        otherExpr->suffixSet_.begin(), otherExpr->suffixSet_.end());
+    suffixSet.insert(suffixSet_.begin(), suffixSet_.end());
+    return std::make_unique<SuffixExpr>(std::move(suffixSet));
   }
-
-  str = w_string_new_typed(arg, W_STRING_BYTE);
-  free(arg);
-  if (!str) {
-    query->errmsg = strdup("out of memory");
-    return NULL;
-  }
-
-  return w_query_expr_new(eval_suffix, dispose_suffix, str);
-}
-W_TERM_PARSER("suffix", suffix_parser)
+};
+W_TERM_PARSER("suffix", SuffixExpr::parse)
+W_CAP_REG("suffix-set")
 
 /* vim:ts=2:sw=2:et:
  */
